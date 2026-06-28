@@ -1,0 +1,20 @@
+[package]
+name = "otelma-polymarket"
+version = "0.1.0"
+edition = "2021"
+description = "Batteries-included Polymarket CLOB payload + WS frame parser for the otelma record/replay engine."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/babush/otelma"
+
+[dependencies]
+otelma = { path = "../otelma" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# `serde-str` makes Decimal serialize as a string by default, which round-trips
+# losslessly through MessagePack (a numeric encoding would go via f64 and lose
+# precision). See the `decimal_round_trip` test.
+rust_decimal = { version = "1.42", features = ["serde-str"] }
+thiserror = "2.0"
+
+[dev-dependencies]
+rust_decimal_macros = "1.40"
