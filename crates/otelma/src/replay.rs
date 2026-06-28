@@ -402,6 +402,33 @@ mod tests {
             .expect("feeder must not deadlock on pause+stop");
     }
 
+    /// Resume is not one-way: a feeder that starts paused applies nothing until
+    /// `resume()`, then delivers every message. Uses INFINITY speed so that once
+    /// resumed it finishes immediately (no wall-clock-duration assertion).
+    #[test]
+    fn pause_then_resume_delivers_all() {
+        let original = sample_stream();
+        let items: Vec<Result<Message<SampleEvent>, Error>> =
+            original.iter().cloned().map(Ok).collect();
+
+        let control = Arc::new(PlaybackControl::new(f64::INFINITY));
+        control.pause();
+        let feeder_control = Arc::clone(&control);
+
+        let handle = thread::spawn(move || {
+            let mut sink = CollectingSink::default();
+            drive_realtime(items, &mut sink, &feeder_control).expect("realtime");
+            sink.applied
+        });
+
+        // Give the paused feeder a beat (it must apply nothing yet), then resume.
+        thread::sleep(Duration::from_millis(50));
+        control.resume();
+        let applied = handle.join().expect("join feeder");
+
+        assert_eq!(applied, original, "resume must deliver every message");
+    }
+
     /// Bug 2: an extreme speed makes the scaled gap overflow `Duration`; the
     /// feeder must not panic and must still terminate on stop.
     #[test]

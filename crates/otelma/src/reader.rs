@@ -424,4 +424,176 @@ mod tests {
         assert_eq!(results[0].as_ref().expect("ok").seq, 0);
         assert!(results[1].is_err());
     }
+
+    /// A stored timestamp outside the `DateTime<Utc>` range surfaces as
+    /// `TimestampOutOfRange` (not a panic). Hand-write a part with `i64::MAX`
+    /// micros — valid Arrow, but unrepresentable as a UTC instant.
+    #[test]
+    fn out_of_range_timestamp_is_error() {
+        use arrow::array::{
+            ArrayRef, BinaryArray, StringArray, TimestampMicrosecondArray, UInt64Array,
+        };
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("tempdir");
+        let seq: ArrayRef = Arc::new(UInt64Array::from(vec![0u64]));
+        let timestamp: ArrayRef =
+            Arc::new(TimestampMicrosecondArray::from(vec![i64::MAX]).with_timezone("UTC"));
+        let type_name: ArrayRef = Arc::new(StringArray::from(vec!["Tick"]));
+        let blob = crate::encode_payload(&SampleEvent::Tick).expect("encode");
+        let payload: ArrayRef = Arc::new(BinaryArray::from(vec![blob.as_slice()]));
+        let batch = RecordBatch::try_new(
+            crate::part_schema(),
+            vec![seq, timestamp, type_name, payload],
+        )
+        .expect("batch");
+
+        let path = dir.path().join("part-0000.parquet");
+        let file = std::fs::File::create(&path).expect("create");
+        let mut writer = ArrowWriter::try_new(file, crate::part_schema(), None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let reader = SessionReader::<SampleEvent>::open(dir.path()).expect("open");
+        let results: Vec<Result<Message<SampleEvent>, Error>> = reader.collect();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            results[0],
+            Err(Error::TimestampOutOfRange { micros }) if micros == i64::MAX
+        ));
+    }
+
+    /// A part whose `seq` column is the wrong Arrow type (Int64, not UInt64) is
+    /// a foreign/corrupt file: the column downcast fails with `SchemaColumn`.
+    #[test]
+    fn wrong_column_type_is_schema_error() {
+        use arrow::array::{
+            ArrayRef, BinaryArray, Int64Array, StringArray, TimestampMicrosecondArray,
+        };
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        // Same column names/order as the part schema, but seq is Int64.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("type_name", DataType::Utf8, false),
+            Field::new("payload", DataType::Binary, false),
+        ]));
+
+        let dir = tempdir().expect("tempdir");
+        let seq: ArrayRef = Arc::new(Int64Array::from(vec![0i64]));
+        let timestamp: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![ts("2026-01-01T10:00:00Z").timestamp_micros()])
+                .with_timezone("UTC"),
+        );
+        let type_name: ArrayRef = Arc::new(StringArray::from(vec!["Tick"]));
+        let blob = crate::encode_payload(&SampleEvent::Tick).expect("encode");
+        let payload: ArrayRef = Arc::new(BinaryArray::from(vec![blob.as_slice()]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![seq, timestamp, type_name, payload],
+        )
+        .expect("batch");
+
+        let path = dir.path().join("part-0000.parquet");
+        let file = std::fs::File::create(&path).expect("create");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let reader = SessionReader::<SampleEvent>::open(dir.path()).expect("open");
+        let results: Vec<Result<Message<SampleEvent>, Error>> = reader.collect();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            results[0],
+            Err(Error::SchemaColumn { column: "seq" })
+        ));
+    }
+
+    /// A part written as two record batches (two writes before close) reads all
+    /// rows back in order — the reader iterates batches within a part, not just
+    /// the first.
+    #[test]
+    fn reads_all_rows_across_multiple_batches_in_one_part() {
+        use arrow::array::{
+            ArrayRef, BinaryArray, StringArray, TimestampMicrosecondArray, UInt64Array,
+        };
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let make_batch = |seqs: &[u64], base_sec: i64| {
+            let seq: ArrayRef = Arc::new(UInt64Array::from(seqs.to_vec()));
+            let timestamp: ArrayRef = Arc::new(
+                TimestampMicrosecondArray::from(
+                    seqs.iter()
+                        .map(|&s| {
+                            DateTime::<Utc>::from_timestamp(base_sec + s as i64, 0)
+                                .expect("ts")
+                                .timestamp_micros()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .with_timezone("UTC"),
+            );
+            let type_name: ArrayRef = Arc::new(StringArray::from(vec!["Tick"; seqs.len()]));
+            let blob = crate::encode_payload(&SampleEvent::Tick).expect("encode");
+            let payload: ArrayRef = Arc::new(BinaryArray::from(vec![blob.as_slice(); seqs.len()]));
+            RecordBatch::try_new(
+                crate::part_schema(),
+                vec![seq, timestamp, type_name, payload],
+            )
+            .expect("batch")
+        };
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("part-0000.parquet");
+        let file = std::fs::File::create(&path).expect("create");
+        let mut writer = ArrowWriter::try_new(file, crate::part_schema(), None).expect("writer");
+        // Two separate batches in the same part file.
+        writer.write(&make_batch(&[0, 1], 0)).expect("write b1");
+        writer.write(&make_batch(&[2, 3], 100)).expect("write b2");
+        writer.close().expect("close");
+
+        let reader = SessionReader::<SampleEvent>::open(dir.path()).expect("open");
+        let seqs: Vec<u64> = reader.map(|m| m.expect("ok").seq).collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3]);
+    }
+
+    /// A legitimately empty (zero-row) middle part is skipped, not treated as an
+    /// error: `[part0=rows, part1=empty, part2=rows]` reads the full stream and
+    /// the fuse-on-error does not trip on the empty part.
+    #[test]
+    fn empty_middle_part_is_skipped_not_an_error() {
+        let dir = tempdir().expect("tempdir");
+        // part-0000: one row.
+        write_raw_part(
+            &dir.path().join("part-0000.parquet"),
+            &[(0, "2026-01-01T10:00:00Z", SampleEvent::Tick)],
+        );
+        // part-0001: zero rows (empty batch with the correct schema).
+        write_raw_part(&dir.path().join("part-0001.parquet"), &[]);
+        // part-0002: another row, monotonically after part-0000.
+        write_raw_part(
+            &dir.path().join("part-0002.parquet"),
+            &[(1, "2026-01-01T11:00:00Z", SampleEvent::Tick)],
+        );
+
+        let reader = SessionReader::<SampleEvent>::open(dir.path()).expect("open");
+        let results: Vec<Result<Message<SampleEvent>, Error>> = reader.collect();
+        let seqs: Vec<u64> = results
+            .iter()
+            .map(|r| r.as_ref().expect("no error on empty middle part").seq)
+            .collect();
+        assert_eq!(seqs, vec![0, 1]);
+    }
 }

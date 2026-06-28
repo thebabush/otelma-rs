@@ -465,6 +465,24 @@ mod tests {
         assert!(saw_data, "an emitted event must mark the session as stable");
     }
 
+    #[tokio::test]
+    async fn handle_frame_returns_false_when_channel_closed() {
+        // A valid book frame, but the receiver is gone: emit fails, so
+        // handle_frame reports the channel is closed (Ok(false)).
+        let book =
+            r#"{"event_type":"book","asset_id":"t","bids":[{"price":"0.5","size":"1"}],"asks":[]}"#;
+        let (tx, rx) = mpsc::channel(4);
+        drop(rx);
+        let mut stamper = Stamper::new(|| dt(1));
+        let mut saw_data = false;
+
+        let kept_alive = handle_frame(WsMessage::text(book), &tx, &mut stamper, &mut saw_data)
+            .await
+            .expect("handle_frame ok");
+
+        assert!(!kept_alive, "a closed channel must report Ok(false)");
+    }
+
     /// Spin up a local WS server that accepts one connection, expects the
     /// subscribe frame, sends one `book` frame, then closes. Drive the real
     /// client against it and assert it emits Connection{true} then the Book.
@@ -527,6 +545,87 @@ mod tests {
         assert_eq!(book.exchange_ts_millis, Some(1_700_000_000_000));
 
         // Stop the client and clean up.
+        shutdown.cancel();
+        server.await.expect("server task");
+        let _ = tokio::time::timeout(Duration::from_secs(5), client_task)
+            .await
+            .expect("client stops");
+    }
+
+    /// End-to-end reconnect: a mock server serves one `book` then closes, and on
+    /// the second accept serves another `book`. The real client must reconnect
+    /// and keep `seq` strictly increasing across the gap, with the connection
+    /// markers in order:
+    /// Connection{true}=0, Book=1, Connection{false}=2, Connection{true}=3,
+    /// Book=4.
+    #[tokio::test]
+    async fn reconnect_keeps_seq_monotonic_end_to_end() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("ws://{addr}");
+
+        // Mock server: accept twice, each time expect the subscribe frame, send
+        // one book, then close so the client reconnects.
+        let server = tokio::spawn(async move {
+            for asset in ["tok-A", "tok-B"] {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("ws handshake");
+                let sub = ws.next().await.expect("a frame").expect("ok frame");
+                assert_eq!(
+                    sub.into_text().expect("text").as_str(),
+                    r#"{"assets_ids":["tok-1"],"type":"market"}"#
+                );
+                let book = format!(
+                    r#"{{"event_type":"book","asset_id":"{asset}","bids":[{{"price":"0.5","size":"1"}}],"asks":[]}}"#
+                );
+                ws.send(WsMessage::text(book)).await.expect("send book");
+                ws.close(None).await.expect("close");
+            }
+        });
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let shutdown = CancellationToken::new();
+        let client_shutdown = shutdown.clone();
+
+        // Advancing clock so timestamps are non-decreasing and visible.
+        let tick = std::sync::atomic::AtomicI64::new(1_700_000_000);
+        let clock = move || {
+            let s = tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            dt(s)
+        };
+        let client = PolymarketClient::with_url(url, vec!["tok-1".to_string()]).with_clock(clock);
+        let client_task = tokio::spawn(async move { client.run(tx, client_shutdown).await });
+
+        // Collect the five expected messages, each under a timeout.
+        let mut msgs = Vec::new();
+        for _ in 0..5 {
+            let m = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no timeout")
+                .expect("a message");
+            msgs.push(m);
+        }
+
+        // Markers and books in the right order across the reconnect.
+        assert_eq!(msgs[0].payload, PolyEvent::Connection { connected: true });
+        assert!(matches!(&msgs[1].payload, PolyEvent::Book(b) if b.asset_id.as_str() == "tok-A"));
+        assert_eq!(msgs[2].payload, PolyEvent::Connection { connected: false });
+        assert_eq!(msgs[3].payload, PolyEvent::Connection { connected: true });
+        assert!(matches!(&msgs[4].payload, PolyEvent::Book(b) if b.asset_id.as_str() == "tok-B"));
+
+        // seq strictly increasing across the whole stream (reconnect included).
+        let seqs: Vec<u64> = msgs.iter().map(|m| m.seq).collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3, 4]);
+        for w in msgs.windows(2) {
+            assert!(w[1].seq > w[0].seq, "seq must strictly increase");
+            assert!(w[1].timestamp >= w[0].timestamp, "ts non-decreasing");
+        }
+
         shutdown.cancel();
         server.await.expect("server task");
         let _ = tokio::time::timeout(Duration::from_secs(5), client_task)
