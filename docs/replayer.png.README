@@ -1,0 +1,11 @@
+The README references `docs/replayer.png`, a screenshot of the egui replayer.
+
+To produce it:
+
+    cargo run -p otelma-replay-egui
+
+This synthesizes a deterministic demo session and plays it back with live
+price/depth plots. Screenshot the window and save it here as `replayer.png`.
+
+The PNG is not committed in this environment (no display to capture it); drop
+the file in and it will appear in the README.
