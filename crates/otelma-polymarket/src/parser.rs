@@ -16,6 +16,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::event::{BookUpdate, Level, PolyEvent, Side, Trade};
+use crate::types::{AssetId, MarketId, Price, Size};
 
 /// Errors from [`parse_ws_frame`].
 #[derive(Debug, Error)]
@@ -36,6 +37,15 @@ pub enum ParseError {
         value: String,
         /// The underlying parse error.
         source: rust_decimal::Error,
+    },
+
+    /// A recognized event carried a negative price or size — corrupt-known.
+    #[error("negative {field}: {value}")]
+    Negative {
+        /// Which field carried the negative value (`price` or `size`).
+        field: &'static str,
+        /// The offending value.
+        value: rust_decimal::Decimal,
     },
 }
 
@@ -120,16 +130,16 @@ fn interpret(raw: RawEvent) -> Result<Option<PolyEvent>, ParseError> {
 
     match event_type {
         "book" => Ok(Some(PolyEvent::Book(BookUpdate {
-            asset_id,
+            asset_id: AssetId::from(asset_id),
             bids: parse_levels(raw.bids)?,
             asks: parse_levels(raw.asks)?,
-            market: raw.market,
+            market: raw.market.map(MarketId::from),
             exchange_ts_millis: raw.timestamp.map(ts_to_millis),
         }))),
         "last_trade_price" | "price_change" => Ok(Some(PolyEvent::Trade(Trade {
-            asset_id,
-            price: parse_decimal_opt(raw.price.as_deref(), "price")?,
-            size: parse_decimal_opt(raw.size.as_deref(), "size")?,
+            asset_id: AssetId::from(asset_id),
+            price: parse_price_opt(raw.price.as_deref())?,
+            size: parse_size_opt(raw.size.as_deref())?,
             side: raw.side.as_deref().and_then(parse_side),
         }))),
         // Unmodeled event type → skip.
@@ -142,8 +152,8 @@ fn parse_levels(raw: Vec<RawLevel>) -> Result<Vec<Level>, ParseError> {
     raw.into_iter()
         .map(|l| {
             Ok(Level {
-                price: parse_decimal(&l.price, "book level price")?,
-                size: parse_decimal(&l.size, "book level size")?,
+                price: Price::new(parse_decimal(&l.price, "book level price")?)?,
+                size: Size::new(parse_decimal(&l.size, "book level size")?)?,
             })
         })
         .collect()
@@ -158,9 +168,15 @@ fn parse_decimal(s: &str, field: &'static str) -> Result<Decimal, ParseError> {
     })
 }
 
-/// Parse an optional Decimal string.
-fn parse_decimal_opt(s: Option<&str>, field: &'static str) -> Result<Option<Decimal>, ParseError> {
-    s.map(|v| parse_decimal(v, field)).transpose()
+/// Parse an optional [`Price`] (non-numeric or negative → corrupt-known error).
+fn parse_price_opt(s: Option<&str>) -> Result<Option<Price>, ParseError> {
+    s.map(|v| Price::new(parse_decimal(v, "price")?))
+        .transpose()
+}
+
+/// Parse an optional [`Size`] (non-numeric or negative → corrupt-known error).
+fn parse_size_opt(s: Option<&str>) -> Result<Option<Size>, ParseError> {
+    s.map(|v| Size::new(parse_decimal(v, "size")?)).transpose()
 }
 
 /// Parse a side string case-insensitively; unrecognized → `None` (not an error).
@@ -187,6 +203,14 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
+    fn price(d: Decimal) -> Price {
+        Price::new(d).expect("non-negative price")
+    }
+
+    fn size(d: Decimal) -> Size {
+        Size::new(d).expect("non-negative size")
+    }
+
     #[test]
     fn parses_single_book_frame() {
         let raw = r#"{
@@ -202,27 +226,27 @@ mod tests {
         let PolyEvent::Book(book) = &events[0] else {
             panic!("expected Book, got {:?}", events[0]);
         };
-        assert_eq!(book.asset_id, "tok-1");
-        assert_eq!(book.market.as_deref(), Some("0xabc"));
+        assert_eq!(book.asset_id.as_str(), "tok-1");
+        assert_eq!(book.market.as_ref().map(|m| m.as_str()), Some("0xabc"));
         assert_eq!(book.exchange_ts_millis, Some(1_700_000_000_000));
         assert_eq!(
             book.bids,
             vec![
                 Level {
-                    price: dec!(0.52),
-                    size: dec!(100)
+                    price: price(dec!(0.52)),
+                    size: size(dec!(100))
                 },
                 Level {
-                    price: dec!(0.51),
-                    size: dec!(200)
+                    price: price(dec!(0.51)),
+                    size: size(dec!(200))
                 },
             ]
         );
         assert_eq!(
             book.asks,
             vec![Level {
-                price: dec!(0.55),
-                size: dec!(80)
+                price: price(dec!(0.55)),
+                size: size(dec!(80))
             }]
         );
     }
@@ -246,13 +270,13 @@ mod tests {
         ]"#;
         let events = parse_ws_frame(raw).expect("parse");
         assert_eq!(events.len(), 2);
-        assert!(matches!(&events[0], PolyEvent::Book(b) if b.asset_id == "a"));
+        assert!(matches!(&events[0], PolyEvent::Book(b) if b.asset_id.as_str() == "a"));
         let PolyEvent::Trade(trade) = &events[1] else {
             panic!("expected Trade");
         };
-        assert_eq!(trade.asset_id, "b");
-        assert_eq!(trade.price, Some(dec!(0.53)));
-        assert_eq!(trade.size, Some(dec!(12)));
+        assert_eq!(trade.asset_id.as_str(), "b");
+        assert_eq!(trade.price, Some(price(dec!(0.53))));
+        assert_eq!(trade.size, Some(size(dec!(12))));
         assert_eq!(trade.side, Some(Side::Buy));
     }
 
@@ -320,6 +344,24 @@ mod tests {
                 field: "book level price",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn negative_book_price_is_error() {
+        let raw = r#"{"event_type":"book","asset_id":"t","bids":[{"price":"-0.01","size":"1"}],"asks":[]}"#;
+        assert!(matches!(
+            parse_ws_frame(raw),
+            Err(ParseError::Negative { field: "price", .. })
+        ));
+    }
+
+    #[test]
+    fn negative_trade_size_is_error() {
+        let raw = r#"{"event_type":"last_trade_price","asset_id":"t","price":"0.5","size":"-1"}"#;
+        assert!(matches!(
+            parse_ws_frame(raw),
+            Err(ParseError::Negative { field: "size", .. })
         ));
     }
 }

@@ -8,6 +8,8 @@
 use eframe::egui;
 use egui_plot::{Line, MarkerShape, Plot, Points};
 
+use otelma_polymarket::AssetId;
+
 use crate::feeder::Feeder;
 use crate::state::ReplayState;
 
@@ -20,7 +22,7 @@ const SPEED_MAX: f64 = 1000.0;
 /// The replayer application.
 pub struct ReplayApp {
     feeder: Feeder,
-    selected_asset: Option<String>,
+    selected_asset: Option<AssetId>,
     /// Last finite speed chosen on the slider (restored when leaving "fast").
     last_finite_speed: f64,
     fast: bool,
@@ -122,8 +124,8 @@ impl ReplayApp {
         ui.horizontal(|ui| {
             ui.label("asset:");
             for asset in &assets {
-                let selected = self.selected_asset.as_deref() == Some(asset.as_str());
-                if ui.selectable_label(selected, asset).clicked() {
+                let selected = self.selected_asset.as_ref() == Some(asset);
+                if ui.selectable_label(selected, asset.as_str()).clicked() {
                     self.selected_asset = Some(asset.clone());
                 }
             }

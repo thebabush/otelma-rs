@@ -6,8 +6,9 @@
 //! has no hardcoded token ids or market-specific logic.
 
 use otelma::Payload;
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+
+use crate::types::{AssetId, MarketId, Price, Size};
 
 /// Order side as reported by the venue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,22 +23,22 @@ pub enum Side {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Level {
     /// Price of the level.
-    pub price: Decimal,
+    pub price: Price,
     /// Size resting at the level.
-    pub size: Decimal,
+    pub size: Size,
 }
 
 /// A full order-book snapshot for one asset.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BookUpdate {
     /// The venue token id this book is for.
-    pub asset_id: String,
+    pub asset_id: AssetId,
     /// Bid levels, in the venue's own ordering (as received on the wire).
     pub bids: Vec<Level>,
     /// Ask levels, in the venue's own ordering (as received on the wire).
     pub asks: Vec<Level>,
     /// The venue's market / condition id, if present.
-    pub market: Option<String>,
+    pub market: Option<MarketId>,
     /// The venue's own event timestamp in milliseconds, if present.
     pub exchange_ts_millis: Option<i64>,
 }
@@ -46,11 +47,11 @@ pub struct BookUpdate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trade {
     /// The venue token id this trade is for.
-    pub asset_id: String,
+    pub asset_id: AssetId,
     /// Trade price, if reported.
-    pub price: Option<Decimal>,
+    pub price: Option<Price>,
     /// Trade size, if reported.
-    pub size: Option<Decimal>,
+    pub size: Option<Size>,
     /// Aggressor side, if reported and recognized.
     pub side: Option<Side>,
 }
@@ -85,6 +86,14 @@ mod tests {
     use otelma::{decode_payload, encode_payload};
     use rust_decimal_macros::dec;
 
+    fn price(d: rust_decimal::Decimal) -> Price {
+        Price::new(d).expect("non-negative price")
+    }
+
+    fn size(d: rust_decimal::Decimal) -> Size {
+        Size::new(d).expect("non-negative size")
+    }
+
     #[test]
     fn type_name_tags() {
         let book = PolyEvent::Book(BookUpdate {
@@ -107,25 +116,26 @@ mod tests {
     }
 
     /// The headline serde-config guard: awkward decimals must survive the
-    /// MessagePack payload codec exactly. This only holds because `rust_decimal`
-    /// is built with `serde-str` (string encoding, not f64).
+    /// MessagePack payload codec exactly through the `Price`/`Size` newtypes.
+    /// This only holds because `rust_decimal` is built with `serde-str` (string
+    /// encoding, not f64) and the newtypes are `#[serde(transparent)]`.
     #[test]
     fn decimal_round_trip_through_msgpack() {
         let event = PolyEvent::Book(BookUpdate {
             asset_id: "tok".into(),
             bids: vec![
                 Level {
-                    price: dec!(0.523),
-                    size: dec!(0.001),
+                    price: price(dec!(0.523)),
+                    size: size(dec!(0.001)),
                 },
                 Level {
-                    price: dec!(1234.5678),
-                    size: dec!(100),
+                    price: price(dec!(1234.5678)),
+                    size: size(dec!(100)),
                 },
             ],
             asks: vec![Level {
-                price: dec!(0.99999),
-                size: dec!(0.5),
+                price: price(dec!(0.99999)),
+                size: size(dec!(0.5)),
             }],
             market: Some("0xfeed".into()),
             exchange_ts_millis: Some(1_700_000_000_000),
@@ -134,5 +144,11 @@ mod tests {
         let blob = encode_payload(&event).expect("encode");
         let decoded: PolyEvent = decode_payload(&blob).expect("decode");
         assert_eq!(decoded, event);
+        // Confirm the inner decimals survived exactly.
+        let PolyEvent::Book(b) = &decoded else {
+            panic!("expected Book");
+        };
+        assert_eq!(b.bids[0].price.value(), dec!(0.523));
+        assert_eq!(b.bids[0].size.value(), dec!(0.001));
     }
 }

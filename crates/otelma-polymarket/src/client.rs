@@ -501,7 +501,7 @@ mod tests {
         let PolyEvent::Book(book) = &second.payload else {
             panic!("expected Book, got {:?}", second.payload);
         };
-        assert_eq!(book.asset_id, "tok-1");
+        assert_eq!(book.asset_id.as_str(), "tok-1");
         assert_eq!(book.exchange_ts_millis, Some(1_700_000_000_000));
 
         // Stop the client and clean up.

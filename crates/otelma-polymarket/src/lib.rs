@@ -10,7 +10,9 @@
 mod client;
 mod event;
 mod parser;
+mod types;
 
 pub use client::{subscribe_message, Error, PolymarketClient, Stamper, DEFAULT_URL};
 pub use event::{BookUpdate, Level, PolyEvent, Side, Trade};
 pub use parser::{parse_ws_frame, ParseError};
+pub use types::{AssetId, MarketId, Price, Size};

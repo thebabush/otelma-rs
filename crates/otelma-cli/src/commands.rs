@@ -108,9 +108,16 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use otelma::{Message, Payload};
-    use otelma_polymarket::{BookUpdate, Level};
+    use otelma_polymarket::{BookUpdate, Level, Price, Size};
     use rust_decimal_macros::dec;
     use tempfile::tempdir;
+
+    fn lvl(p: rust_decimal::Decimal, s: rust_decimal::Decimal) -> Level {
+        Level {
+            price: Price::new(p).expect("non-negative"),
+            size: Size::new(s).expect("non-negative"),
+        }
+    }
 
     fn book_msg(seq: u64, secs: i64, asset: &str) -> Message<PolyEvent> {
         Message::new(
@@ -118,14 +125,8 @@ mod tests {
             Utc.timestamp_opt(secs, 0).single().expect("ts"),
             PolyEvent::Book(BookUpdate {
                 asset_id: asset.into(),
-                bids: vec![Level {
-                    price: dec!(0.5),
-                    size: dec!(1),
-                }],
-                asks: vec![Level {
-                    price: dec!(0.6),
-                    size: dec!(1),
-                }],
+                bids: vec![lvl(dec!(0.5), dec!(1))],
+                asks: vec![lvl(dec!(0.6), dec!(1))],
                 market: None,
                 exchange_ts_millis: None,
             }),

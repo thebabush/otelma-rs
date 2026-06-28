@@ -9,20 +9,19 @@ use std::fmt::Write as _;
 
 use chrono::{DateTime, Utc};
 use otelma::{Message, Sink};
-use otelma_polymarket::{PolyEvent, Side};
-use rust_decimal::Decimal;
+use otelma_polymarket::{AssetId, PolyEvent, Price, Side};
 
 /// Per-asset running tally derived from the stream.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct AssetSummary {
     /// Best (highest) bid from the most recent book, if any.
-    pub best_bid: Option<Decimal>,
+    pub best_bid: Option<Price>,
     /// Best (lowest) ask from the most recent book, if any.
-    pub best_ask: Option<Decimal>,
+    pub best_ask: Option<Price>,
     /// Number of trade events seen for this asset.
     pub trade_count: u64,
     /// Last trade price seen for this asset, if any carried a price.
-    pub last_trade_price: Option<Decimal>,
+    pub last_trade_price: Option<Price>,
 }
 
 /// Tallies messages applied during a replay.
@@ -34,7 +33,7 @@ pub struct SummarySink {
     last_seq: Option<u64>,
     first_ts: Option<DateTime<Utc>>,
     last_ts: Option<DateTime<Utc>>,
-    per_asset: BTreeMap<String, AssetSummary>,
+    per_asset: BTreeMap<AssetId, AssetSummary>,
 }
 
 impl SummarySink {
@@ -81,15 +80,15 @@ impl SummarySink {
             for (asset, a) in &self.per_asset {
                 let bid = a
                     .best_bid
-                    .map(|d| d.to_string())
+                    .map(|p| p.value().to_string())
                     .unwrap_or_else(|| "-".to_string());
                 let ask = a
                     .best_ask
-                    .map(|d| d.to_string())
+                    .map(|p| p.value().to_string())
                     .unwrap_or_else(|| "-".to_string());
                 let last = a
                     .last_trade_price
-                    .map(|d| d.to_string())
+                    .map(|p| p.value().to_string())
                     .unwrap_or_else(|| "-".to_string());
                 let _ = writeln!(
                     out,
@@ -153,8 +152,10 @@ pub fn render_line(msg: &Message<PolyEvent>) -> String {
                 format!(
                     "{} bid={} ask={}",
                     b.asset_id,
-                    bid.map(|d| d.to_string()).unwrap_or_else(|| "-".into()),
-                    ask.map(|d| d.to_string()).unwrap_or_else(|| "-".into()),
+                    bid.map(|p| p.value().to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    ask.map(|p| p.value().to_string())
+                        .unwrap_or_else(|| "-".into()),
                 ),
             )
         }
@@ -163,8 +164,12 @@ pub fn render_line(msg: &Message<PolyEvent>) -> String {
             format!(
                 "{} price={} size={} side={}",
                 t.asset_id,
-                t.price.map(|d| d.to_string()).unwrap_or_else(|| "-".into()),
-                t.size.map(|d| d.to_string()).unwrap_or_else(|| "-".into()),
+                t.price
+                    .map(|p| p.value().to_string())
+                    .unwrap_or_else(|| "-".into()),
+                t.size
+                    .map(|s| s.value().to_string())
+                    .unwrap_or_else(|| "-".into()),
                 match t.side {
                     Some(Side::Buy) => "BUY",
                     Some(Side::Sell) => "SELL",
@@ -180,17 +185,33 @@ pub fn render_line(msg: &Message<PolyEvent>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otelma_polymarket::{BookUpdate, Level, Trade};
+    use otelma_polymarket::{BookUpdate, Level, Size, Trade};
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     fn dt(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(secs, 0).expect("valid")
     }
 
+    fn price(d: Decimal) -> Price {
+        Price::new(d).expect("non-negative")
+    }
+
+    fn lvl(p: Decimal, s: Decimal) -> Level {
+        Level {
+            price: price(p),
+            size: Size::new(s).expect("non-negative"),
+        }
+    }
+
+    fn asset(id: &str) -> AssetId {
+        AssetId::from(id)
+    }
+
     fn book(
         seq: u64,
         secs: i64,
-        asset: &str,
+        id: &str,
         bids: Vec<Level>,
         asks: Vec<Level>,
     ) -> Message<PolyEvent> {
@@ -198,7 +219,7 @@ mod tests {
             seq,
             dt(secs),
             PolyEvent::Book(BookUpdate {
-                asset_id: asset.into(),
+                asset_id: id.into(),
                 bids,
                 asks,
                 market: None,
@@ -207,14 +228,14 @@ mod tests {
         )
     }
 
-    fn trade(seq: u64, secs: i64, asset: &str, price: Option<Decimal>) -> Message<PolyEvent> {
+    fn trade(seq: u64, secs: i64, id: &str, p: Option<Decimal>) -> Message<PolyEvent> {
         Message::new(
             seq,
             dt(secs),
             PolyEvent::Trade(Trade {
-                asset_id: asset.into(),
-                price,
-                size: Some(dec!(1)),
+                asset_id: id.into(),
+                price: p.map(price),
+                size: Some(Size::new(dec!(1)).expect("non-negative")),
                 side: Some(Side::Buy),
             }),
         )
@@ -229,26 +250,8 @@ mod tests {
                 1,
                 110,
                 "A",
-                vec![
-                    Level {
-                        price: dec!(0.50),
-                        size: dec!(10),
-                    },
-                    Level {
-                        price: dec!(0.52),
-                        size: dec!(5),
-                    },
-                ],
-                vec![
-                    Level {
-                        price: dec!(0.55),
-                        size: dec!(8),
-                    },
-                    Level {
-                        price: dec!(0.54),
-                        size: dec!(3),
-                    },
-                ],
+                vec![lvl(dec!(0.50), dec!(10)), lvl(dec!(0.52), dec!(5))],
+                vec![lvl(dec!(0.55), dec!(8)), lvl(dec!(0.54), dec!(3))],
             ),
             trade(2, 120, "A", Some(dec!(0.53))),
             trade(3, 130, "A", Some(dec!(0.531))),
@@ -264,12 +267,12 @@ mod tests {
         assert_eq!(sink.seq_range(), Some((0, 3)));
         assert_eq!(sink.time_range(), Some((dt(100), dt(130))));
 
-        let a = &sink.per_asset["A"];
+        let a = &sink.per_asset[&asset("A")];
         // best bid = max(0.50, 0.52) = 0.52; best ask = min(0.55, 0.54) = 0.54.
-        assert_eq!(a.best_bid, Some(dec!(0.52)));
-        assert_eq!(a.best_ask, Some(dec!(0.54)));
+        assert_eq!(a.best_bid, Some(price(dec!(0.52))));
+        assert_eq!(a.best_ask, Some(price(dec!(0.54))));
         assert_eq!(a.trade_count, 2);
-        assert_eq!(a.last_trade_price, Some(dec!(0.531)));
+        assert_eq!(a.last_trade_price, Some(price(dec!(0.531))));
     }
 
     #[test]
@@ -280,30 +283,12 @@ mod tests {
             0,
             1,
             "Z",
-            vec![
-                Level {
-                    price: dec!(0.10),
-                    size: dec!(1),
-                },
-                Level {
-                    price: dec!(0.90),
-                    size: dec!(1),
-                },
-            ],
-            vec![
-                Level {
-                    price: dec!(0.99),
-                    size: dec!(1),
-                },
-                Level {
-                    price: dec!(0.91),
-                    size: dec!(1),
-                },
-            ],
+            vec![lvl(dec!(0.10), dec!(1)), lvl(dec!(0.90), dec!(1))],
+            vec![lvl(dec!(0.99), dec!(1)), lvl(dec!(0.91), dec!(1))],
         ));
-        let z = &sink.per_asset["Z"];
-        assert_eq!(z.best_bid, Some(dec!(0.90)));
-        assert_eq!(z.best_ask, Some(dec!(0.91)));
+        let z = &sink.per_asset[&asset("Z")];
+        assert_eq!(z.best_bid, Some(price(dec!(0.90))));
+        assert_eq!(z.best_ask, Some(price(dec!(0.91))));
     }
 
     #[test]
@@ -318,8 +303,8 @@ mod tests {
         let mut sink = SummarySink::new();
         sink.apply(&trade(0, 1, "A", Some(dec!(0.4))));
         sink.apply(&trade(1, 2, "A", None));
-        let a = &sink.per_asset["A"];
+        let a = &sink.per_asset[&asset("A")];
         assert_eq!(a.trade_count, 2);
-        assert_eq!(a.last_trade_price, Some(dec!(0.4)));
+        assert_eq!(a.last_trade_price, Some(price(dec!(0.4))));
     }
 }

@@ -9,7 +9,7 @@ use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
 use otelma::{Message, Recorder};
-use otelma_polymarket::{BookUpdate, Level, PolyEvent, Side, Trade};
+use otelma_polymarket::{BookUpdate, Level, PolyEvent, Price, Side, Size, Trade};
 use rust_decimal::Decimal;
 
 /// The asset ids used by the demo session.
@@ -49,9 +49,24 @@ impl Rng {
     }
 }
 
-/// Convert a price expressed in integer ticks (1 tick = 0.001) to a `Decimal`.
-fn ticks_to_price(ticks: i64) -> Decimal {
-    Decimal::new(ticks, 3)
+/// Convert a price expressed in integer ticks (1 tick = 0.001) to a [`Price`].
+/// The demo's mids are clamped to a positive range, so the value is always
+/// non-negative; a failure here would be a generator bug.
+fn ticks_to_price(ticks: i64) -> Price {
+    Price::new(Decimal::new(ticks, 3)).expect("demo price is non-negative")
+}
+
+/// Build a non-negative [`Size`] from a whole-unit count.
+fn size_units(units: i64) -> Size {
+    Size::new(Decimal::new(units, 0)).expect("demo size is non-negative")
+}
+
+/// A demo book level.
+fn level(price_ticks: i64, size_units_count: i64) -> Level {
+    Level {
+        price: ticks_to_price(price_ticks),
+        size: size_units(size_units_count),
+    }
 }
 
 /// Generate a deterministic demo session into `dir` and return the message
@@ -103,35 +118,17 @@ pub fn build_demo_messages(seed: u64) -> Vec<Message<PolyEvent>> {
             let ask = mid + half_spread;
 
             // Two levels each side, depth thinning away from top of book.
-            let bids = vec![
-                Level {
-                    price: ticks_to_price(bid),
-                    size: Decimal::new(100, 0),
-                },
-                Level {
-                    price: ticks_to_price(bid - 2),
-                    size: Decimal::new(250, 0),
-                },
-            ];
-            let asks = vec![
-                Level {
-                    price: ticks_to_price(ask),
-                    size: Decimal::new(90, 0),
-                },
-                Level {
-                    price: ticks_to_price(ask + 2),
-                    size: Decimal::new(220, 0),
-                },
-            ];
+            let bids = vec![level(bid, 100), level(bid - 2, 250)];
+            let asks = vec![level(ask, 90), level(ask + 2, 220)];
 
             out.push(Message::new(
                 seq,
                 t,
                 PolyEvent::Book(BookUpdate {
-                    asset_id: (*asset).to_string(),
+                    asset_id: (*asset).into(),
                     bids,
                     asks,
-                    market: Some("0xDEMO".to_string()),
+                    market: Some("0xDEMO".into()),
                     exchange_ts_millis: Some(t.timestamp_millis()),
                 }),
             ));
@@ -148,9 +145,9 @@ pub fn build_demo_messages(seed: u64) -> Vec<Message<PolyEvent>> {
                     seq,
                     t,
                     PolyEvent::Trade(Trade {
-                        asset_id: (*asset).to_string(),
+                        asset_id: (*asset).into(),
                         price: Some(ticks_to_price(mid)),
-                        size: Some(Decimal::new(10, 0)),
+                        size: Some(size_units(10)),
                         side: Some(side),
                     }),
                 ));

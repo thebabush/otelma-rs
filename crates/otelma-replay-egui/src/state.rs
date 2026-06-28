@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use otelma::{Message, Sink};
-use otelma_polymarket::{Level, PolyEvent, Side};
+use otelma_polymarket::{AssetId, Level, PolyEvent, Price, Side};
 
 /// One sample of an asset's top-of-book over time (plot point).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -52,7 +52,7 @@ pub struct AssetState {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ReplayState {
     /// Per-asset accumulated series, keyed by asset id (sorted).
-    pub assets: BTreeMap<String, AssetState>,
+    pub assets: BTreeMap<AssetId, AssetState>,
     /// Most recent `seq` applied.
     pub current_seq: Option<u64>,
     /// Most recent timestamp applied.
@@ -65,7 +65,7 @@ pub struct ReplayState {
 
 impl ReplayState {
     /// Asset ids seen so far, in sorted order.
-    pub fn asset_ids(&self) -> Vec<String> {
+    pub fn asset_ids(&self) -> Vec<AssetId> {
         self.assets.keys().cloned().collect()
     }
 
@@ -78,9 +78,12 @@ impl ReplayState {
 /// Best bid = max bid price; best ask = min ask price. Computed as extrema so we
 /// never assume which end of the venue's level vec is top-of-book.
 fn best_bid_ask(bids: &[Level], asks: &[Level]) -> Option<(f64, f64)> {
-    let best_bid = bids.iter().map(|l| l.price).max()?;
-    let best_ask = asks.iter().map(|l| l.price).min()?;
-    Some((decimal_to_f64(best_bid), decimal_to_f64(best_ask)))
+    let best_bid: Price = bids.iter().map(|l| l.price).max()?;
+    let best_ask: Price = asks.iter().map(|l| l.price).min()?;
+    Some((
+        decimal_to_f64(best_bid.value()),
+        decimal_to_f64(best_ask.value()),
+    ))
 }
 
 /// Lossy conversion for plotting only (ImPlot/egui work in f64).
@@ -135,12 +138,22 @@ impl Sink<PolyEvent> for GuiSink<'_> {
                 asset.depth_bids = book
                     .bids
                     .iter()
-                    .map(|l| (decimal_to_f64(l.price), decimal_to_f64(l.size)))
+                    .map(|l| {
+                        (
+                            decimal_to_f64(l.price.value()),
+                            decimal_to_f64(l.size.value()),
+                        )
+                    })
                     .collect();
                 asset.depth_asks = book
                     .asks
                     .iter()
-                    .map(|l| (decimal_to_f64(l.price), decimal_to_f64(l.size)))
+                    .map(|l| {
+                        (
+                            decimal_to_f64(l.price.value()),
+                            decimal_to_f64(l.size.value()),
+                        )
+                    })
                     .collect();
             }
             PolyEvent::Trade(trade) => {
@@ -148,7 +161,7 @@ impl Sink<PolyEvent> for GuiSink<'_> {
                     let asset = self.state.assets.entry(trade.asset_id.clone()).or_default();
                     asset.trades.push(TradePoint {
                         t_secs,
-                        price: decimal_to_f64(price),
+                        price: decimal_to_f64(price.value()),
                         side: trade.side,
                     });
                 }
@@ -162,7 +175,7 @@ impl Sink<PolyEvent> for GuiSink<'_> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use otelma_polymarket::{BookUpdate, Trade};
+    use otelma_polymarket::{BookUpdate, Size, Trade};
     use rust_decimal_macros::dec;
 
     fn dt(secs: i64) -> DateTime<Utc> {
@@ -190,7 +203,10 @@ mod tests {
     }
 
     fn lvl(price: rust_decimal::Decimal, size: rust_decimal::Decimal) -> Level {
-        Level { price, size }
+        Level {
+            price: Price::new(price).expect("non-negative price"),
+            size: Size::new(size).expect("non-negative size"),
+        }
     }
 
     #[test]
@@ -218,7 +234,7 @@ mod tests {
         assert_eq!(state.start_ts, Some(dt(100)));
         assert_eq!(state.current_ts, Some(dt(160)));
 
-        let a = &state.assets["A"];
+        let a = &state.assets[&AssetId::from("A")];
         assert_eq!(a.book_series.len(), 1);
         let p = a.book_series[0];
         // start at t=100, this book at t=160 → 60s.
@@ -248,8 +264,8 @@ mod tests {
                 dt(30),
                 PolyEvent::Trade(Trade {
                     asset_id: "A".into(),
-                    price: Some(dec!(0.55)),
-                    size: Some(dec!(2)),
+                    price: Some(Price::new(dec!(0.55)).expect("price")),
+                    size: Some(Size::new(dec!(2)).expect("size")),
                     side: Some(Side::Buy),
                 }),
             ));
@@ -266,7 +282,7 @@ mod tests {
             ));
         }
 
-        let a = &state.assets["A"];
+        let a = &state.assets[&AssetId::from("A")];
         assert_eq!(a.trades.len(), 1);
         assert_eq!(a.trades[0].price, 0.55);
         assert_eq!(a.trades[0].t_secs, 30.0);
@@ -293,7 +309,10 @@ mod tests {
                 vec![lvl(dec!(0.2), dec!(1))],
             ));
         }
-        assert_eq!(state.asset_ids(), vec!["A".to_string(), "Z".to_string()]);
+        assert_eq!(
+            state.asset_ids(),
+            vec![AssetId::from("A"), AssetId::from("Z")]
+        );
 
         state.clear();
         assert_eq!(state, ReplayState::default());
