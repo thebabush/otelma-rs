@@ -34,6 +34,16 @@ impl<T> Message<T> {
     }
 }
 
+/// A recordable payload.
+///
+/// Implementors provide a per-value type tag stored in the `type_name` column,
+/// allowing parts to be filtered or inspected without decoding the payload blob.
+pub trait Payload: Serialize {
+    /// Per-value type tag stored in the `type_name` column (e.g. an enum
+    /// variant name like `"Book"` / `"Trade"`).
+    fn type_name(&self) -> &str;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,6 +54,21 @@ mod tests {
     enum SampleEvent {
         Tick,
         Book { bid: i64, ask: i64 },
+    }
+
+    impl Payload for SampleEvent {
+        fn type_name(&self) -> &str {
+            match self {
+                SampleEvent::Tick => "Tick",
+                SampleEvent::Book { .. } => "Book",
+            }
+        }
+    }
+
+    #[test]
+    fn payload_type_name() {
+        assert_eq!(SampleEvent::Tick.type_name(), "Tick");
+        assert_eq!(SampleEvent::Book { bid: 1, ask: 2 }.type_name(), "Book");
     }
 
     fn fixed_timestamp() -> DateTime<Utc> {

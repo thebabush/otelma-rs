@@ -2,3 +2,7 @@
 /recordings
 *.parquet
 .DS_Store
+
+# Local Claude plugin opt-in markers (personal tooling, not part of the project)
+.nonna
+.rrr

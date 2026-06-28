@@ -12,4 +12,16 @@ pub enum Error {
     /// A payload blob failed to decode from MessagePack.
     #[error("failed to decode payload: {0}")]
     Decode(#[from] rmp_serde::decode::Error),
+
+    /// An Arrow operation failed (e.g. building a record batch).
+    #[error("arrow error: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
+
+    /// A Parquet read/write operation failed.
+    #[error("parquet error: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
+
+    /// A filesystem operation failed.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
