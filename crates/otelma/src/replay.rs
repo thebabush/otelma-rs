@@ -223,7 +223,7 @@ mod tests {
     }
 
     impl Payload for SampleEvent {
-        fn type_name(&self) -> &str {
+        fn type_name(&self) -> &'static str {
             match self {
                 SampleEvent::Tick => "Tick",
                 SampleEvent::Book { .. } => "Book",
@@ -314,7 +314,7 @@ mod tests {
                 ts("2026-01-01T10:01:00Z"),
                 SampleEvent::Tick,
             )),
-            Err(Error::Schema("boom".to_string())),
+            Err(Error::SchemaColumn { column: "seq" }),
             Ok(Message::new(
                 2,
                 ts("2026-01-01T10:02:00Z"),
@@ -325,7 +325,7 @@ mod tests {
         let mut sink = CollectingSink::default();
         let result = drive(items, &mut sink);
 
-        assert!(matches!(result, Err(Error::Schema(_))));
+        assert!(matches!(result, Err(Error::SchemaColumn { .. })));
         // Saw exactly the two Oks preceding the error.
         assert_eq!(sink.applied.len(), 2);
         assert_eq!(sink.applied[0], good);

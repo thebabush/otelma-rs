@@ -129,7 +129,7 @@ impl<T: DeserializeOwned> SessionReader<T> {
 
         let ts_micros = column::<TimestampMicrosecondArray>(batch, 1, "timestamp")?.value(row);
         let timestamp = DateTime::<Utc>::from_timestamp_micros(ts_micros)
-            .ok_or_else(|| Error::Schema(format!("timestamp micros out of range: {ts_micros}")))?;
+            .ok_or(Error::TimestampOutOfRange { micros: ts_micros })?;
 
         let blob = column::<BinaryArray>(batch, 3, "payload")?.value(row);
         let payload = decode_payload::<T>(blob)?;
@@ -182,17 +182,18 @@ impl<T: DeserializeOwned> Iterator for SessionReader<T> {
 }
 
 /// Downcast column `idx` of `batch` to a concrete Arrow array type, returning a
-/// [`Error::Schema`] (not a panic) on type mismatch — the file may be foreign.
+/// [`Error::SchemaColumn`] (not a panic) on type mismatch — the file may be
+/// foreign.
 fn column<'a, A: Array + 'static>(
     batch: &'a RecordBatch,
     idx: usize,
-    name: &str,
+    name: &'static str,
 ) -> Result<&'a A, Error> {
     batch
         .column(idx)
         .as_any()
         .downcast_ref::<A>()
-        .ok_or_else(|| Error::Schema(format!("column `{name}` has unexpected Arrow type")))
+        .ok_or(Error::SchemaColumn { column: name })
 }
 
 #[cfg(test)]
@@ -210,7 +211,7 @@ mod tests {
     }
 
     impl Payload for SampleEvent {
-        fn type_name(&self) -> &str {
+        fn type_name(&self) -> &'static str {
             match self {
                 SampleEvent::Tick => "Tick",
                 SampleEvent::Book { .. } => "Book",

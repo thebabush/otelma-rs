@@ -40,8 +40,9 @@ impl<T> Message<T> {
 /// allowing parts to be filtered or inspected without decoding the payload blob.
 pub trait Payload: Serialize {
     /// Per-value type tag stored in the `type_name` column (e.g. an enum
-    /// variant name like `"Book"` / `"Trade"`).
-    fn type_name(&self) -> &str;
+    /// variant name like `"Book"` / `"Trade"`). Returning `&'static str` keeps
+    /// the tag allocation-free through the recorder.
+    fn type_name(&self) -> &'static str;
 }
 
 #[cfg(test)]
@@ -57,7 +58,7 @@ mod tests {
     }
 
     impl Payload for SampleEvent {
-        fn type_name(&self) -> &str {
+        fn type_name(&self) -> &'static str {
             match self {
                 SampleEvent::Tick => "Tick",
                 SampleEvent::Book { .. } => "Book",

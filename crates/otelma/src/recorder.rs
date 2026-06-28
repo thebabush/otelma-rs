@@ -73,7 +73,7 @@ impl PartIndex {
 struct PartBuffer {
     seq: Vec<u64>,
     timestamp_micros: Vec<i64>,
-    type_name: Vec<String>,
+    type_name: Vec<&'static str>,
     payload: Vec<Vec<u8>>,
 }
 
@@ -147,9 +147,7 @@ impl Recorder {
         let micros = msg.timestamp.timestamp_micros();
         self.buffer.seq.push(msg.seq);
         self.buffer.timestamp_micros.push(micros);
-        self.buffer
-            .type_name
-            .push(msg.payload.type_name().to_string());
+        self.buffer.type_name.push(msg.payload.type_name());
         self.buffer.payload.push(encode_payload(&msg.payload)?);
         Ok(())
     }
@@ -213,7 +211,7 @@ mod tests {
     }
 
     impl Payload for SampleEvent {
-        fn type_name(&self) -> &str {
+        fn type_name(&self) -> &'static str {
             match self {
                 SampleEvent::Tick => "Tick",
                 SampleEvent::Book { .. } => "Book",

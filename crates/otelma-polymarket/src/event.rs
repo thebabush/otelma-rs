@@ -70,7 +70,7 @@ pub enum PolyEvent {
 }
 
 impl Payload for PolyEvent {
-    fn type_name(&self) -> &str {
+    fn type_name(&self) -> &'static str {
         match self {
             PolyEvent::Book(_) => "Book",
             PolyEvent::Trade(_) => "Trade",

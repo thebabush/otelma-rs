@@ -43,7 +43,17 @@ pub enum Error {
         ts: chrono::DateTime<chrono::Utc>,
     },
 
-    /// A Parquet column had an unexpected Arrow type (corrupt or foreign file).
-    #[error("schema error: {0}")]
-    Schema(String),
+    /// A Parquet column had an unexpected Arrow type (foreign or corrupt file).
+    #[error("column `{column}` has unexpected Arrow type")]
+    SchemaColumn {
+        /// The offending column name.
+        column: &'static str,
+    },
+
+    /// A stored timestamp was outside the representable `DateTime<Utc>` range.
+    #[error("timestamp micros out of range: {micros}")]
+    TimestampOutOfRange {
+        /// The offending epoch-microseconds value.
+        micros: i64,
+    },
 }
