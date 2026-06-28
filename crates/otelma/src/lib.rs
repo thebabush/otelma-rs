@@ -12,9 +12,11 @@
 mod codec;
 mod error;
 mod message;
+mod reader;
 mod recorder;
 
 pub use codec::{decode_payload, encode_payload};
 pub use error::Error;
 pub use message::{Message, Payload};
+pub use reader::SessionReader;
 pub use recorder::Recorder;

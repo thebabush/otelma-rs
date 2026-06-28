@@ -24,4 +24,26 @@ pub enum Error {
     /// A filesystem operation failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The session stream violated its ordering invariant: `seq` must be
+    /// strictly increasing and `timestamp` non-decreasing across the whole
+    /// session (part boundaries included).
+    #[error(
+        "monotonicity violation: previous (seq={prev_seq}, ts={prev_ts}) \
+         then (seq={seq}, ts={ts})"
+    )]
+    Monotonicity {
+        /// Sequence number of the last accepted message.
+        prev_seq: u64,
+        /// Timestamp of the last accepted message.
+        prev_ts: chrono::DateTime<chrono::Utc>,
+        /// Sequence number of the offending message.
+        seq: u64,
+        /// Timestamp of the offending message.
+        ts: chrono::DateTime<chrono::Utc>,
+    },
+
+    /// A Parquet column had an unexpected Arrow type (corrupt or foreign file).
+    #[error("schema error: {0}")]
+    Schema(String),
 }
