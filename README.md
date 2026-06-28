@@ -140,7 +140,7 @@ enum MyEvent {
 
 impl Payload for MyEvent {
     // Stored in the `type_name` column for filtering without decoding.
-    fn type_name(&self) -> &str {
+    fn type_name(&self) -> &'static str {
         match self {
             MyEvent::Quote { .. } => "Quote",
             MyEvent::Heartbeat => "Heartbeat",
