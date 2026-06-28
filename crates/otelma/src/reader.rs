@@ -86,15 +86,9 @@ impl<T: DeserializeOwned> SessionReader<T> {
     /// files. A missing directory is an error; an empty one yields an empty
     /// stream.
     pub fn open(session_dir: impl AsRef<Path>) -> Result<Self, Error> {
-        let mut parts: Vec<PathBuf> = std::fs::read_dir(session_dir)?
-            .map(|entry| entry.map(|e| e.path()))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|p| p.extension().is_some_and(|ext| ext == "parquet"))
-            .collect();
-        // Zero-padded names sort lexically into numeric part order.
-        parts.sort();
-        // Stored reversed so `pop` yields parts in ascending order.
+        // Discover parts in ascending order, then reverse so `pop` yields them
+        // ascending.
+        let mut parts = crate::parts::part_paths(session_dir)?;
         parts.reverse();
         Ok(Self {
             remaining_parts: parts,

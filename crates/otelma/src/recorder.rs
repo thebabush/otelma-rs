@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BinaryArray, StringArray, TimestampMicrosecondArray, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 use parquet::arrow::ArrowWriter;
@@ -26,6 +25,7 @@ use parquet::file::properties::WriterProperties;
 use crate::codec::encode_payload;
 use crate::error::Error;
 use crate::message::{Message, Payload};
+use crate::parts::part_schema;
 
 /// Default safety cap on buffered rows before forcing an early roll.
 const DEFAULT_MAX_ROWS: usize = 2_000_000;
@@ -121,20 +121,6 @@ impl Recorder {
         })
     }
 
-    /// Arrow schema shared by every part file.
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("seq", DataType::UInt64, false),
-            Field::new(
-                "timestamp",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                false,
-            ),
-            Field::new("type_name", DataType::Utf8, false),
-            Field::new("payload", DataType::Binary, false),
-        ]))
-    }
-
     /// Append a message to the current part, rolling first if its timestamp
     /// crosses into a later UTC hour or the safety cap is hit.
     pub fn record<T: Payload>(&mut self, msg: &Message<T>) -> Result<(), Error> {
@@ -186,11 +172,11 @@ impl Recorder {
                 .collect::<Vec<_>>(),
         ));
 
-        let batch = RecordBatch::try_new(Self::schema(), vec![seq, timestamp, type_name, payload])?;
+        let batch = RecordBatch::try_new(part_schema(), vec![seq, timestamp, type_name, payload])?;
 
         let path = self.session_dir.join(self.part_idx.file_name());
         let file = fs::File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, Self::schema(), Some(self.props.clone()))?;
+        let mut writer = ArrowWriter::try_new(file, part_schema(), Some(self.props.clone()))?;
         writer.write(&batch)?;
         writer.close()?;
         Ok(())
@@ -206,6 +192,7 @@ impl Recorder {
 mod tests {
     use super::*;
     use crate::codec::decode_payload;
+    use arrow::datatypes::{DataType, TimeUnit};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use serde::{Deserialize, Serialize};
     use tempfile::tempdir;
