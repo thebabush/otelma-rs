@@ -14,7 +14,6 @@
 //! messages in the same order; only the timing differs.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -129,8 +128,6 @@ pub struct PlaybackControl {
     speed_bits: AtomicU64,
     paused: AtomicBool,
     stop: AtomicBool,
-    /// Serializes speed updates so concurrent `set_speed` calls can't tear.
-    speed_lock: Mutex<()>,
 }
 
 impl PlaybackControl {
@@ -140,7 +137,6 @@ impl PlaybackControl {
             speed_bits: AtomicU64::new(speed.to_bits()),
             paused: AtomicBool::new(false),
             stop: AtomicBool::new(false),
-            speed_lock: Mutex::new(()),
         }
     }
 
@@ -149,12 +145,9 @@ impl PlaybackControl {
         f64::from_bits(self.speed_bits.load(Ordering::Relaxed))
     }
 
-    /// Set the speed multiplier.
+    /// Set the speed multiplier. A `u64` atomic store cannot tear, so no
+    /// serialization is needed.
     pub fn set_speed(&self, speed: f64) {
-        let _guard = self
-            .speed_lock
-            .lock()
-            .expect("playback speed lock poisoned");
         self.speed_bits.store(speed.to_bits(), Ordering::Relaxed);
     }
 
