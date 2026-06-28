@@ -18,7 +18,6 @@ egui = "0.35"
 egui_plot = "0.36"
 chrono = "0.4"
 rust_decimal = "1.42"
-tempfile = "3.27"
 
 [dev-dependencies]
 rust_decimal_macros = "1.40"

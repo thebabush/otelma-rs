@@ -2,43 +2,30 @@
 //! session as it plays.
 //!
 //! ```text
-//! otelma-replay-egui [SESSION_DIR]
+//! otelma-replay-egui <SESSION_DIR>
 //! ```
 //!
-//! With no argument it generates a deterministic synthetic demo session in a
-//! temp dir and replays that, so `cargo run -p otelma-replay-egui` shows moving
-//! plots with zero setup.
+//! `SESSION_DIR` must be a real recording produced by `otelma record`. The
+//! replayer only ever replays recorded data — it never fabricates a session.
 
 mod app;
-mod demo;
 mod feeder;
 mod state;
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use app::ReplayApp;
 use feeder::Feeder;
 
-/// Seed for the built-in demo session.
-const DEMO_SEED: u64 = 0x0742;
 /// Initial playback speed (real-time multiplier).
 const INITIAL_SPEED: f64 = 60.0;
 
-fn main() -> eframe::Result<()> {
-    // Resolve the session: an explicit dir, or a generated demo in a temp dir.
-    // The TempDir is kept alive for the process so the recording isn't deleted.
-    let (session_dir, _keepalive) = match std::env::args().nth(1) {
-        Some(dir) => (PathBuf::from(dir), None),
-        None => {
-            let tmp = tempfile::tempdir().expect("create temp dir for demo session");
-            let count =
-                demo::generate_demo_session(tmp.path(), DEMO_SEED).expect("generate demo session");
-            eprintln!(
-                "no session dir given; generated {count}-message demo at {}",
-                tmp.path().display()
-            );
-            (tmp.path().to_path_buf(), Some(tmp))
-        }
+fn main() -> ExitCode {
+    let Some(session_dir) = std::env::args().nth(1).map(PathBuf::from) else {
+        eprintln!("usage: otelma-replay-egui <SESSION_DIR>");
+        eprintln!("  SESSION_DIR is a recording produced by `otelma record`.");
+        return ExitCode::FAILURE;
     };
 
     let feeder = Feeder::start(session_dir, INITIAL_SPEED);
@@ -50,9 +37,15 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    match eframe::run_native(
         "otelma replayer",
         options,
         Box::new(|_cc| Ok(Box::new(ReplayApp::new(feeder)))),
-    )
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("otelma-replay-egui: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }

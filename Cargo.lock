@@ -3104,7 +3104,6 @@ dependencies = [
  "otelma-polymarket",
  "rust_decimal",
  "rust_decimal_macros",
- "tempfile",
 ]
 
 [[package]]

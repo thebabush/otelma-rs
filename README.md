@@ -13,9 +13,9 @@ forever.
 
 ![otelma replayer](docs/replayer.png)
 
-> The screenshot above is produced by running `cargo run -p otelma-replay-egui`
-> and capturing the window. The image is not committed; drop a PNG at
-> `docs/replayer.png` to populate it.
+> The screenshot above is produced by replaying a real recording —
+> `cargo run -p otelma-replay-egui <SESSION_DIR>` — and capturing the window.
+> The image is not committed; drop a PNG at `docs/replayer.png` to populate it.
 
 ## Quickstart
 
@@ -23,13 +23,6 @@ Build the workspace (the GUI example is gated out, so this stays lean):
 
 ```bash
 cargo build
-```
-
-Run the zero-setup demo replayer — it synthesizes a deterministic demo session
-and plays it back with live plots, no recording needed:
-
-```bash
-cargo run -p otelma-replay-egui
 ```
 
 Use the CLI (`otelma`) to record, replay, and compact real sessions:
@@ -65,6 +58,16 @@ by asset:
 
 `record` places no orders and is read-only against the venue; it only subscribes
 to market data.
+
+To watch a recording with live plots and a timeline scrubber, run the desktop
+replayer against a real session directory:
+
+```bash
+# Record a session (see above), then replay it in the GUI.
+cargo run -p otelma-replay-egui <SESSION_DIR>
+```
+
+The replayer only ever replays recorded data — it never fabricates a session.
 
 ## How it works
 
@@ -118,7 +121,7 @@ columns; the payload is an opaque MessagePack blob. The reader reconstructs
 | `otelma` | The core engine: `Message<T>`, `Recorder`, `SessionReader`, `drive`/`drive_realtime`, `Sink`. Generic, venue-agnostic. |
 | `otelma-polymarket` | Batteries-included Polymarket integration: `PolyEvent` payload, a pure WS frame parser, and a reconnecting WebSocket client. |
 | `otelma-cli` | The `otelma` binary: `record` / `replay` / `compact`. |
-| `otelma-replay-egui` | A desktop replayer (eframe + egui_plot) with live plots and a synthetic demo. Non-default workspace member, so the core build stays lean. |
+| `otelma-replay-egui` | A desktop replayer (eframe + egui_plot) with live plots and a timeline scrubber; replays a real recorded session. Non-default workspace member, so the core build stays lean. |
 
 ## Adding your own payload
 
