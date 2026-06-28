@@ -101,13 +101,27 @@ where
 }
 
 /// Sleep `gap_secs / speed`, in slices, aborting promptly on stop. A non-finite
-/// or non-positive speed sleeps not at all (fastest playback).
+/// or non-positive speed sleeps not at all (fastest playback). A scaled gap that
+/// overflows `Duration` (e.g. an absurdly small speed like `1e-300`) is treated
+/// as effectively-infinite: slice-sleep until stop, never panicking.
 fn sleep_scaled(gap_secs: f64, control: &PlaybackControl) {
     let speed = control.speed();
     if !speed.is_finite() || speed <= 0.0 || gap_secs <= 0.0 {
         return;
     }
-    let mut remaining = Duration::from_secs_f64(gap_secs / speed);
+
+    let secs = gap_secs / speed;
+    // `Duration::try_from_secs_f64` rejects negatives, NaN, and values that
+    // overflow `u64` seconds — exactly the cases that would otherwise panic.
+    let mut remaining = match Duration::try_from_secs_f64(secs) {
+        Ok(d) => d,
+        Err(_) => {
+            // Effectively-very-long gap: stay responsive, never busy-spin.
+            sleep_until_stop(control);
+            return;
+        }
+    };
+
     while remaining > Duration::ZERO {
         if control.should_stop() {
             return;
@@ -115,6 +129,14 @@ fn sleep_scaled(gap_secs: f64, control: &PlaybackControl) {
         let slice = remaining.min(SLEEP_SLICE);
         thread::sleep(slice);
         remaining -= slice;
+    }
+}
+
+/// Slice-sleep indefinitely until the control is stopped (used for a scaled gap
+/// too large to represent as a `Duration`).
+fn sleep_until_stop(control: &PlaybackControl) {
+    while !control.should_stop() {
+        thread::sleep(SLEEP_SLICE);
     }
 }
 
@@ -371,5 +393,52 @@ mod tests {
         handle
             .join()
             .expect("feeder must not deadlock on pause+stop");
+    }
+
+    /// Bug 2: an extreme speed makes the scaled gap overflow `Duration`; the
+    /// feeder must not panic and must still terminate on stop.
+    #[test]
+    fn drive_realtime_extreme_speed_does_not_panic() {
+        // A 30s gap divided by 1e-300 overflows u64 seconds.
+        let msgs = [
+            Message::new(0, ts("2026-01-01T10:00:00Z"), SampleEvent::Tick),
+            Message::new(1, ts("2026-01-01T10:00:30Z"), SampleEvent::Tick),
+        ];
+        let items: Vec<Result<Message<SampleEvent>, Error>> =
+            msgs.iter().cloned().map(Ok).collect();
+
+        let control = Arc::new(PlaybackControl::new(1e-300));
+        let feeder_control = Arc::clone(&control);
+
+        let handle = thread::spawn(move || {
+            let mut sink = CollectingSink::default();
+            // Must not panic on the overflowing scaled gap.
+            drive_realtime(items, &mut sink, &feeder_control).expect("realtime");
+            sink.applied.len()
+        });
+
+        // First message applies immediately (no preceding gap), then the feeder
+        // is stuck in the effectively-infinite gap sleep; stop must release it.
+        thread::sleep(Duration::from_millis(100));
+        control.stop();
+        let applied = handle.join().expect("feeder must not panic or hang");
+        assert!(applied < 2, "stop should abort before the second message");
+    }
+
+    /// NaN / 0 / negative speed still mean "as fast as possible".
+    #[test]
+    fn drive_realtime_degenerate_speeds_are_fast() {
+        let original = sample_stream();
+        for speed in [f64::NAN, 0.0, -1.0] {
+            let items: Vec<Result<Message<SampleEvent>, Error>> =
+                original.iter().cloned().map(Ok).collect();
+            let control = PlaybackControl::new(speed);
+            let mut sink = CollectingSink::default();
+            drive_realtime(items, &mut sink, &control).expect("realtime");
+            assert_eq!(
+                sink.applied, original,
+                "speed {speed} should apply all fast"
+            );
+        }
     }
 }
