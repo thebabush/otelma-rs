@@ -7,8 +7,10 @@
 //! never maps them to domain meaning; that's the downstream user's job. The WS
 //! client lives in a separate module (next step); this layer has no networking.
 
+mod client;
 mod event;
 mod parser;
 
+pub use client::{subscribe_message, Error, PolymarketClient, Stamper, DEFAULT_URL};
 pub use event::{BookUpdate, Level, PolyEvent, Side, Trade};
 pub use parser::{parse_ws_frame, ParseError};
