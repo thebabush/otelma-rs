@@ -272,6 +272,33 @@ mod tests {
         assert_eq!(z.best_ask, Some(price(dec!(0.91))));
     }
 
+    /// Polymarket `book` events are full snapshots, so a later book with an empty
+    /// side legitimately means "no bids/asks now" — best_bid must drop back to
+    /// `None`, not retain the prior snapshot's value. Pins this semantics so it
+    /// can't silently regress to a stale-carry behavior.
+    #[test]
+    fn empty_book_side_clears_best_to_none() {
+        let mut sink = SummarySink::new();
+        sink.apply(&book(
+            0,
+            1,
+            "A",
+            vec![lvl(dec!(0.50), dec!(1))],
+            vec![lvl(dec!(0.55), dec!(1))],
+        ));
+        // Sanity: the first snapshot populated both sides.
+        assert_eq!(
+            sink.per_asset[&asset("A")].best_bid,
+            Some(price(dec!(0.50)))
+        );
+
+        // A later full snapshot with no bids → best_bid becomes None.
+        sink.apply(&book(1, 2, "A", vec![], vec![lvl(dec!(0.55), dec!(1))]));
+        let a = &sink.per_asset[&asset("A")];
+        assert_eq!(a.best_bid, None, "empty bids snapshot clears best_bid");
+        assert_eq!(a.best_ask, Some(price(dec!(0.55))), "asks still present");
+    }
+
     #[test]
     fn empty_sink_renders_without_panic() {
         let sink = SummarySink::new();

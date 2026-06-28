@@ -119,4 +119,54 @@ mod tests {
         assert!(!is_part_file(Path::new("/x/part-0000.txt")));
         assert!(!is_part_file(Path::new("/x/0000.parquet")));
     }
+
+    /// Compacting an empty session directory produces a valid Parquet file that
+    /// reads back as a zero-row stream (the part schema, no rows).
+    #[test]
+    fn compact_empty_session_yields_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("compacted.parquet");
+        compact_session(dir.path(), &out).expect("compact");
+
+        let file = std::fs::File::open(&out).expect("open compacted");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("builder")
+            .build()
+            .expect("reader");
+        let rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
+        assert_eq!(rows, 0, "empty session compacts to a zero-row file");
+    }
+
+    /// Record → compact *in place* → replay must NOT double the stream: the
+    /// `compacted.parquet` is ignored by `part_paths`, so SessionReader still
+    /// reads only the original parts.
+    #[test]
+    fn compact_in_place_does_not_double_replay() {
+        use crate::test_support::SampleEvent;
+        use crate::test_support::{record_stream, sample_stream};
+        use crate::SessionReader;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let original = sample_stream();
+        record_stream(dir.path(), &original);
+
+        // Compact into the same directory.
+        compact_session(dir.path(), dir.path().join("compacted.parquet")).expect("compact");
+
+        // Replay still yields exactly the original stream, not twice.
+        let read: Vec<_> = SessionReader::<SampleEvent>::open(dir.path())
+            .expect("open")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read");
+        assert_eq!(read, original, "compacted file must not be replayed twice");
+
+        // And the compacted file itself round-trips the same row count.
+        let file = std::fs::File::open(dir.path().join("compacted.parquet")).expect("open");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("builder")
+            .build()
+            .expect("reader");
+        let compacted_rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
+        assert_eq!(compacted_rows, original.len());
+    }
 }

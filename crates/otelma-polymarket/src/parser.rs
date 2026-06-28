@@ -393,4 +393,60 @@ mod tests {
             Err(ParseError::Negative { field: "size", .. })
         ));
     }
+
+    #[test]
+    fn empty_array_frame_is_zero_events() {
+        assert_eq!(parse_ws_frame("[]").expect("parse"), vec![]);
+    }
+
+    #[test]
+    fn null_trade_price_and_size_are_none() {
+        // JSON null for an optional scalar deserializes to None — not an error.
+        let raw = r#"{"event_type":"last_trade_price","asset_id":"t","price":null,"size":null}"#;
+        let events = parse_ws_frame(raw).expect("parse");
+        let PolyEvent::Trade(trade) = &events[0] else {
+            panic!("expected Trade, got {:?}", events[0]);
+        };
+        assert_eq!(trade.price, None);
+        assert_eq!(trade.size, None);
+    }
+
+    /// Duplicate JSON keys in a frame are rejected as a `Json` error — they do
+    /// NOT silently take last-wins. The top-level `Frame` is `#[serde(untagged)]`
+    /// (single object OR array), and serde's untagged buffering rejects an object
+    /// with duplicate keys rather than collapsing it. Pinned because it is a
+    /// deterministic, fail-loud behavior worth knowing: a duplicate-key frame is
+    /// dropped+logged by the live adapter (handle_frame), not misinterpreted.
+    #[test]
+    fn duplicate_json_keys_are_rejected_not_silently_collapsed() {
+        let raw =
+            r#"{"event_type":"book","asset_id":"first","asset_id":"second","bids":[],"asks":[]}"#;
+        assert!(matches!(parse_ws_frame(raw), Err(ParseError::Json(_))));
+    }
+
+    #[test]
+    fn unknown_nested_and_extra_fields_are_ignored() {
+        // Extra top-level fields and extra fields inside a level must not break
+        // parsing — we model only what we use and ignore the rest.
+        let raw = r#"{
+            "event_type":"book",
+            "asset_id":"tok-1",
+            "hash":"0xdeadbeef",
+            "extra":{"nested":[1,2,3]},
+            "bids":[{"price":"0.52","size":"100","order_id":"abc","flags":7}],
+            "asks":[]
+        }"#;
+        let events = parse_ws_frame(raw).expect("parse");
+        let PolyEvent::Book(book) = &events[0] else {
+            panic!("expected Book");
+        };
+        assert_eq!(book.asset_id.as_str(), "tok-1");
+        assert_eq!(
+            book.bids,
+            vec![Level {
+                price: price(dec!(0.52)),
+                size: size(dec!(100))
+            }]
+        );
+    }
 }
