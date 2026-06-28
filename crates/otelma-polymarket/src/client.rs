@@ -28,7 +28,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
 
 use crate::event::PolyEvent;
-use crate::parser::{parse_ws_frame, ParseError};
+use crate::parser::parse_ws_frame;
 
 /// Default Polymarket CLOB market WebSocket URL.
 pub const DEFAULT_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -46,10 +46,6 @@ pub enum Error {
     /// The WebSocket transport failed (connect/read/write).
     #[error("websocket error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
-
-    /// A frame failed to parse (corrupt recognized event).
-    #[error("frame parse error: {0}")]
-    Parse(#[from] ParseError),
 
     /// The downstream receiver was dropped; nothing left to emit to.
     #[error("emit channel closed")]
@@ -173,17 +169,20 @@ impl<C: Fn() -> DateTime<Utc>> PolymarketClient<C> {
                 return Ok(());
             }
 
+            let mut was_connected = false;
             let session = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return Ok(()),
-                result = run_session(&url, &asset_ids, &tx, &mut stamper, &shutdown) => result,
+                result = run_session(
+                    &url, &asset_ids, &tx, &mut stamper, &shutdown, &mut was_connected,
+                ) => result,
             };
 
             match session {
                 Ok(SessionEnd::Shutdown) => return Ok(()),
                 Ok(SessionEnd::ChannelClosed) => return Err(Error::ChannelClosed),
                 Ok(SessionEnd::Disconnected) => {
-                    // Successful connect happened (backoff reset there); loop.
+                    // Successful connect happened; reset backoff before retrying.
                     backoff = BACKOFF_MIN;
                 }
                 Err(e) => {
@@ -191,13 +190,17 @@ impl<C: Fn() -> DateTime<Utc>> PolymarketClient<C> {
                 }
             }
 
-            // Emit a disconnect marker (best-effort) and back off.
-            if emit(
-                &tx,
-                stamper.stamp(PolyEvent::Connection { connected: false }),
-            )
-            .await
-            .is_err()
+            // Only emit a disconnect marker if the session actually reached the
+            // connected state — a failed initial connect (or a retry during a
+            // prolonged outage) never emitted `Connection{true}`, so emitting a
+            // `false` would be misleading noise.
+            if was_connected
+                && emit(
+                    &tx,
+                    stamper.stamp(PolyEvent::Connection { connected: false }),
+                )
+                .await
+                .is_err()
             {
                 return Err(Error::ChannelClosed);
             }
@@ -220,6 +223,7 @@ async fn run_session<C: Fn() -> DateTime<Utc>>(
     tx: &mpsc::Sender<Message<PolyEvent>>,
     stamper: &mut Stamper<C>,
     shutdown: &CancellationToken,
+    was_connected: &mut bool,
 ) -> Result<SessionEnd, Error> {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await?;
 
@@ -232,6 +236,7 @@ async fn run_session<C: Fn() -> DateTime<Utc>>(
     {
         return Ok(SessionEnd::ChannelClosed);
     }
+    *was_connected = true;
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -275,12 +280,45 @@ async fn handle_frame<C: Fn() -> DateTime<Utc>>(
         _ => return Ok(true),
     };
 
-    for event in parse_ws_frame(&text)? {
+    // The parser is strict ("crash on corrupt-known"), but the live adapter is
+    // the resilience boundary: a single unparseable frame (mis-modeled or
+    // corrupt venue shape) must not tear down the socket and trigger a
+    // reconnect storm. Log it and keep capturing everything else.
+    let events = match parse_ws_frame(&text) {
+        Ok(events) => events,
+        Err(parse_err) => {
+            tracing::warn!(
+                error = %parse_err,
+                frame = %truncate_frame(&text),
+                "skipping unparseable polymarket frame"
+            );
+            return Ok(true);
+        }
+    };
+
+    for event in events {
         if emit(tx, stamper.stamp(event)).await.is_err() {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Truncate a frame to a sane length for logging so a huge frame can't spam.
+fn truncate_frame(text: &str) -> String {
+    const MAX: usize = 200;
+    if text.len() <= MAX {
+        text.to_string()
+    } else {
+        // Respect char boundaries when slicing.
+        let end = text
+            .char_indices()
+            .take_while(|(i, _)| *i < MAX)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        format!("{}…(truncated)", &text[..end])
+    }
 }
 
 /// How a single session ended.
@@ -367,6 +405,42 @@ mod tests {
         });
         let msg = stamper.stamp(book.clone());
         assert_eq!(msg.payload, book);
+    }
+
+    #[tokio::test]
+    async fn handle_frame_skips_corrupt_known_frame() {
+        // A recognized `book` event with a non-numeric price is corrupt-known:
+        // the pure parser errors, but the live adapter must log+skip and keep
+        // the session alive (return Ok(true)) without emitting anything.
+        let corrupt =
+            r#"{"event_type":"book","asset_id":"t","bids":[{"price":"NaN","size":"1"}],"asks":[]}"#;
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut stamper = Stamper::new(|| dt(1));
+
+        let kept_alive = handle_frame(WsMessage::text(corrupt), &tx, &mut stamper)
+            .await
+            .expect("handle_frame ok");
+
+        assert!(kept_alive, "corrupt frame must not tear down the session");
+        // Nothing emitted, and seq counter untouched.
+        assert!(rx.try_recv().is_err(), "no message should be emitted");
+    }
+
+    #[tokio::test]
+    async fn handle_frame_emits_parsed_events() {
+        let book =
+            r#"{"event_type":"book","asset_id":"t","bids":[{"price":"0.5","size":"1"}],"asks":[]}"#;
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut stamper = Stamper::new(|| dt(7));
+
+        let kept_alive = handle_frame(WsMessage::text(book), &tx, &mut stamper)
+            .await
+            .expect("handle_frame ok");
+
+        assert!(kept_alive);
+        let msg = rx.try_recv().expect("one message");
+        assert_eq!(msg.seq, 0);
+        assert!(matches!(msg.payload, PolyEvent::Book(_)));
     }
 
     /// Spin up a local WS server that accepts one connection, expects the
