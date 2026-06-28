@@ -25,6 +25,7 @@ use parquet::file::properties::WriterProperties;
 use crate::codec::encode_payload;
 use crate::error::Error;
 use crate::message::{Message, Payload};
+use crate::monotonic::Monotonicity;
 use crate::parts::part_schema;
 
 /// Default safety cap on buffered rows before forcing an early roll.
@@ -96,6 +97,9 @@ pub struct Recorder {
     buffer: PartBuffer,
     props: WriterProperties,
     max_rows: usize,
+    /// Enforces the same ordering invariant the reader checks, so any session
+    /// the recorder accepts reads back without a mid-stream ordering error.
+    monotonicity: Monotonicity,
 }
 
 impl Recorder {
@@ -118,12 +122,17 @@ impl Recorder {
             buffer: PartBuffer::default(),
             props,
             max_rows,
+            monotonicity: Monotonicity::default(),
         })
     }
 
     /// Append a message to the current part, rolling first if its timestamp
     /// crosses into a later UTC hour or the safety cap is hit.
     pub fn record<T: Payload>(&mut self, msg: &Message<T>) -> Result<(), Error> {
+        // Enforce the stream invariant on write (before buffering): a regressing
+        // seq or timestamp is rejected, so the recording always reads back.
+        self.monotonicity.check(msg.seq, msg.timestamp)?;
+
         let hour = HourBucket::of(msg.timestamp);
 
         match self.current_hour {
@@ -364,5 +373,70 @@ mod tests {
 
         let parts = list_parts(dir.path());
         assert_eq!(parts.len(), 1, "trailing partial hour must be flushed");
+    }
+
+    #[test]
+    fn record_rejects_seq_regression() {
+        let dir = tempdir().expect("tempdir");
+        let mut rec = Recorder::new(dir.path()).expect("recorder");
+        rec.record(&Message::new(
+            5,
+            ts("2026-05-01T12:00:00Z"),
+            SampleEvent::Tick,
+        ))
+        .expect("first record");
+        // seq 3 <= 5 → rejected before buffering.
+        let result = rec.record(&Message::new(
+            3,
+            ts("2026-05-01T12:00:01Z"),
+            SampleEvent::Tick,
+        ));
+        assert!(matches!(
+            result,
+            Err(Error::Monotonicity {
+                prev_seq: 5,
+                seq: 3,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn record_rejects_timestamp_regression() {
+        let dir = tempdir().expect("tempdir");
+        let mut rec = Recorder::new(dir.path()).expect("recorder");
+        rec.record(&Message::new(
+            0,
+            ts("2026-05-01T12:00:10Z"),
+            SampleEvent::Tick,
+        ))
+        .expect("first record");
+        // Earlier timestamp with a larger seq → rejected.
+        let result = rec.record(&Message::new(
+            1,
+            ts("2026-05-01T12:00:09Z"),
+            SampleEvent::Tick,
+        ));
+        assert!(matches!(result, Err(Error::Monotonicity { .. })));
+    }
+
+    #[test]
+    fn record_accepts_equal_timestamp_increasing_seq() {
+        let dir = tempdir().expect("tempdir");
+        let mut rec = Recorder::new(dir.path()).expect("recorder");
+        rec.record(&Message::new(
+            0,
+            ts("2026-05-01T12:00:00Z"),
+            SampleEvent::Tick,
+        ))
+        .expect("first");
+        // Equal timestamp is allowed as long as seq strictly increases.
+        rec.record(&Message::new(
+            1,
+            ts("2026-05-01T12:00:00Z"),
+            SampleEvent::Tick,
+        ))
+        .expect("second");
+        rec.close().expect("close");
     }
 }
