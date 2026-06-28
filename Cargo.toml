@@ -1,3 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/otelma", "crates/otelma-polymarket", "crates/otelma-cli"]
+members = [
+    "crates/otelma",
+    "crates/otelma-polymarket",
+    "crates/otelma-cli",
+    "crates/otelma-replay-egui",
+]
+# The egui replayer pulls in heavy GUI deps; keep it out of the default build so
+# `cargo build`/`test` at the root stay fast. Build it explicitly with
+# `cargo build -p otelma-replay-egui`.
+default-members = [
+    "crates/otelma",
+    "crates/otelma-polymarket",
+    "crates/otelma-cli",
+]

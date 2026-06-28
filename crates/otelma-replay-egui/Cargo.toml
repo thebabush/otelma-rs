@@ -1,0 +1,24 @@
+[package]
+name = "otelma-replay-egui"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop egui replayer for otelma sessions — live market plots with a timeline scrubber."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/babush/otelma"
+
+[[bin]]
+name = "otelma-replay-egui"
+path = "src/main.rs"
+
+[dependencies]
+otelma = { path = "../otelma" }
+otelma-polymarket = { path = "../otelma-polymarket" }
+eframe = "0.35"
+egui = "0.35"
+egui_plot = "0.36"
+chrono = "0.4"
+rust_decimal = "1.42"
+tempfile = "3.27"
+
+[dev-dependencies]
+rust_decimal_macros = "1.40"
