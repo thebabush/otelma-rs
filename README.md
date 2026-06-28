@@ -153,7 +153,6 @@ rec.close()?;
 // Replay through any Sink<MyEvent>:
 let reader = SessionReader::<MyEvent>::open("recordings/my-session")?;
 drive(reader, &mut my_sink)?;
-# Ok::<(), otelma::Error>(())
 ```
 
 ## Status / scope
