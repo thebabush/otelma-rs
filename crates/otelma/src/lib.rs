@@ -12,6 +12,7 @@
 mod codec;
 mod error;
 mod message;
+mod monotonic;
 mod parts;
 mod reader;
 mod recorder;

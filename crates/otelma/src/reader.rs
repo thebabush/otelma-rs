@@ -11,6 +11,13 @@
 //! increasing and `timestamp` non-decreasing across the entire session
 //! (including part boundaries). A violation yields [`Error::Monotonicity`]
 //! rather than silently passing a corrupt recording downstream.
+//!
+//! The iterator is **fused on first error**: once `next()` returns any `Err`
+//! (monotonicity, parquet/IO, schema, or payload decode), every subsequent
+//! `next()` returns `None`. A single corrupt or unreadable part therefore ends
+//! the stream rather than being silently skipped — earlier parts have already
+//! been yielded, consistent with the "lose at most the truncated trailing part"
+//! recovery story.
 
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -24,34 +31,7 @@ use serde::de::DeserializeOwned;
 use crate::codec::decode_payload;
 use crate::error::Error;
 use crate::message::Message;
-
-/// The ordering invariant enforced across the whole session.
-///
-/// Holds the last accepted `(seq, timestamp)` and rejects any row that is not
-/// strictly increasing in `seq` and non-decreasing in `timestamp`.
-#[derive(Default)]
-struct Monotonicity {
-    last: Option<(u64, DateTime<Utc>)>,
-}
-
-impl Monotonicity {
-    /// Check `(seq, ts)` against the last accepted row, updating state on
-    /// success. Returns [`Error::Monotonicity`] on violation.
-    fn check(&mut self, seq: u64, ts: DateTime<Utc>) -> Result<(), Error> {
-        if let Some((prev_seq, prev_ts)) = self.last {
-            if seq <= prev_seq || ts < prev_ts {
-                return Err(Error::Monotonicity {
-                    prev_seq,
-                    prev_ts,
-                    seq,
-                    ts,
-                });
-            }
-        }
-        self.last = Some((seq, ts));
-        Ok(())
-    }
-}
+use crate::monotonic::Monotonicity;
 
 /// A lazily-decoded record batch plus a row cursor.
 struct BatchCursor {
@@ -78,6 +58,9 @@ pub struct SessionReader<T> {
     /// The batch currently being yielded from.
     cursor: Option<BatchCursor>,
     monotonicity: Monotonicity,
+    /// Latched on the first error so the iterator fuses (Bug-1 fix): one corrupt
+    /// or unreadable part ends the stream rather than silently resuming.
+    done: bool,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -95,6 +78,7 @@ impl<T: DeserializeOwned> SessionReader<T> {
             current_part: None,
             cursor: None,
             monotonicity: Monotonicity::default(),
+            done: false,
             _marker: PhantomData,
         })
     }
@@ -159,19 +143,41 @@ impl<T: DeserializeOwned> Iterator for SessionReader<T> {
     type Item = Result<Message<T>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Fused: once any error was returned, the stream is over.
+        if self.done {
+            return None;
+        }
+
         match self.advance_to_batch() {
-            Ok(false) => return None,
+            Ok(false) => {
+                self.done = true;
+                return None;
+            }
             Ok(true) => {}
-            Err(e) => return Some(Err(e)),
+            Err(e) => {
+                self.done = true;
+                return Some(Err(e));
+            }
         }
 
         let cursor = self.cursor.as_mut().expect("advance_to_batch ensured rows");
         let row = cursor.row;
-        cursor.row += 1;
         // Clone the (small, ref-counted) batch handle so we can borrow `self`
         // mutably for monotonicity bookkeeping while reading the row.
         let batch = cursor.batch.clone();
-        Some(self.read_row(&batch, row))
+        let result = self.read_row(&batch, row);
+        match result {
+            Ok(msg) => {
+                // Only advance the row cursor on success, so a fused error never
+                // leaves a half-consumed row behind (defensive; we fuse anyway).
+                self.cursor.as_mut().expect("cursor present").row += 1;
+                Some(Ok(msg))
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
     }
 }
 
@@ -327,5 +333,117 @@ mod tests {
             }
             other => panic!("expected Monotonicity error, got {other:?}"),
         }
+    }
+
+    /// Write a single part file with arbitrary (possibly non-monotonic) rows,
+    /// bypassing the recorder's on-write monotonicity check. Used to fabricate
+    /// corrupt sessions for the reader's fuse tests.
+    fn write_raw_part(path: &Path, rows: &[(u64, &str, SampleEvent)]) {
+        use arrow::array::{
+            ArrayRef, BinaryArray, StringArray, TimestampMicrosecondArray, UInt64Array,
+        };
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let seq: ArrayRef = Arc::new(UInt64Array::from(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        ));
+        let timestamp: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(
+                rows.iter()
+                    .map(|r| ts(r.1).timestamp_micros())
+                    .collect::<Vec<_>>(),
+            )
+            .with_timezone("UTC"),
+        );
+        let type_name: ArrayRef = Arc::new(StringArray::from(
+            rows.iter().map(|r| r.2.type_name()).collect::<Vec<_>>(),
+        ));
+        let blobs: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|r| crate::encode_payload(&r.2).expect("encode"))
+            .collect();
+        let payload: ArrayRef = Arc::new(BinaryArray::from(
+            blobs.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+        ));
+
+        let batch = RecordBatch::try_new(
+            crate::part_schema(),
+            vec![seq, timestamp, type_name, payload],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(path).expect("create");
+        let mut writer = ArrowWriter::try_new(file, crate::part_schema(), None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+    }
+
+    /// Bug 1(a): an error that is not the last row fuses the iterator — no rows
+    /// after the violation are yielded.
+    #[test]
+    fn fuses_on_mid_part_monotonicity_error() {
+        let dir = tempdir().expect("tempdir");
+        // Rows 0,5 then 3 (violates after 5) then 4. All in one part / hour.
+        write_raw_part(
+            &dir.path().join("part-0000.parquet"),
+            &[
+                (0, "2026-01-01T10:00:00Z", SampleEvent::Tick),
+                (5, "2026-01-01T10:00:01Z", SampleEvent::Tick),
+                (3, "2026-01-01T10:00:02Z", SampleEvent::Tick),
+                (4, "2026-01-01T10:00:03Z", SampleEvent::Tick),
+            ],
+        );
+
+        let reader = SessionReader::<SampleEvent>::open(dir.path()).expect("open");
+        let results: Vec<Result<Message<SampleEvent>, Error>> = reader.collect();
+
+        // Ok(0), Ok(5), Err(Monotonicity), then NONE — no Ok(4) leaks through.
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().expect("ok").seq, 0);
+        assert_eq!(results[1].as_ref().expect("ok").seq, 5);
+        assert!(matches!(results[2], Err(Error::Monotonicity { .. })));
+    }
+
+    /// Bug 1(b): a corrupt/unreadable middle part fuses the iterator — the reader
+    /// does not silently resume into the following part's rows.
+    #[test]
+    fn fuses_on_corrupt_middle_part() {
+        let dir = tempdir().expect("tempdir");
+        // part-0000: valid, one row.
+        record_stream(
+            dir.path(),
+            &[Message::new(
+                0,
+                ts("2026-01-01T10:00:00Z"),
+                SampleEvent::Tick,
+            )],
+        );
+        // part-0001: garbage (not a parquet file).
+        std::fs::write(dir.path().join("part-0001.parquet"), b"not parquet")
+            .expect("write garbage");
+        // part-0002: valid, would-be next rows.
+        let dir2 = tempdir().expect("tempdir2");
+        record_stream(
+            dir2.path(),
+            &[Message::new(
+                9,
+                ts("2026-01-01T12:00:00Z"),
+                SampleEvent::Tick,
+            )],
+        );
+        std::fs::copy(
+            dir2.path().join("part-0000.parquet"),
+            dir.path().join("part-0002.parquet"),
+        )
+        .expect("copy");
+
+        let reader = SessionReader::<SampleEvent>::open(dir.path()).expect("open");
+        let results: Vec<Result<Message<SampleEvent>, Error>> = reader.collect();
+
+        // Ok(0), Err(open/build of part-0001), then NONE — no Ok(9) from part-0002.
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().expect("ok").seq, 0);
+        assert!(results[1].is_err());
     }
 }
