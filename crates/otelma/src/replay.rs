@@ -238,8 +238,11 @@ mod tests {
         assert_eq!(sink.applied, original);
     }
 
+    /// Repeatability of a single path: `drive` twice over the same recording
+    /// yields identical results. (True cross-*speed* determinism — the headline
+    /// claim — is covered by `determinism_holds_across_speeds`.)
     #[test]
-    fn drive_is_deterministic() {
+    fn drive_is_repeatable() {
         let dir = tempdir().expect("tempdir");
         record_stream(dir.path(), &sample_stream());
 
@@ -258,6 +261,49 @@ mod tests {
         .expect("drive b");
 
         assert_eq!(sink_a.applied, sink_b.applied);
+    }
+
+    /// The headline determinism claim: the same recording produces identical
+    /// sink state regardless of feeder/speed. `drive`, `drive_realtime` at
+    /// infinity, and `drive_realtime` at a high finite speed must all deliver
+    /// exactly the original messages in the same order.
+    #[test]
+    fn determinism_holds_across_speeds() {
+        let dir = tempdir().expect("tempdir");
+        let original = sample_stream();
+        record_stream(dir.path(), &original);
+
+        // Path 1: deterministic `drive`.
+        let mut sink_drive = CollectingSink::default();
+        drive(
+            SessionReader::<SampleEvent>::open(dir.path()).expect("open"),
+            &mut sink_drive,
+        )
+        .expect("drive");
+
+        // Path 2: real-time at infinite speed (no sleeping).
+        let mut sink_inf = CollectingSink::default();
+        drive_realtime(
+            SessionReader::<SampleEvent>::open(dir.path()).expect("open"),
+            &mut sink_inf,
+            &PlaybackControl::new(f64::INFINITY),
+        )
+        .expect("realtime inf");
+
+        // Path 3: real-time at a high finite speed. The sample stream spans
+        // ~75 minutes of sim time; at 1e6× that is sub-millisecond of real
+        // sleep, so this stays fast and non-flaky.
+        let mut sink_fast = CollectingSink::default();
+        drive_realtime(
+            SessionReader::<SampleEvent>::open(dir.path()).expect("open"),
+            &mut sink_fast,
+            &PlaybackControl::new(1e6),
+        )
+        .expect("realtime fast");
+
+        assert_eq!(sink_drive.applied, original);
+        assert_eq!(sink_inf.applied, original);
+        assert_eq!(sink_fast.applied, original);
     }
 
     #[test]
@@ -302,7 +348,9 @@ mod tests {
 
     #[test]
     fn drive_realtime_stop_terminates_early() {
-        // Large real-time gaps so the feeder is mid-sleep when we stop it.
+        // First message has no preceding gap → it applies immediately. A large
+        // gap precedes message 1, so when we stop during that sleep exactly the
+        // first message has been applied.
         let msgs = [
             Message::new(0, ts("2026-01-01T10:00:00Z"), SampleEvent::Tick),
             Message::new(1, ts("2026-01-01T10:00:30Z"), SampleEvent::Tick),
@@ -311,7 +359,7 @@ mod tests {
         let items: Vec<Result<Message<SampleEvent>, Error>> =
             msgs.iter().cloned().map(Ok).collect();
 
-        // speed 1.0 → 30s gaps; stop should abort well before completion.
+        // speed 1.0 → 30s gaps; stop fires during the first gap.
         let control = Arc::new(PlaybackControl::new(1.0));
         let feeder_control = Arc::clone(&control);
 
@@ -321,12 +369,15 @@ mod tests {
             sink.applied.len()
         });
 
-        // Let the first message apply, then stop during the long gap sleep.
+        // Let the first message apply, then stop during the 30s gap sleep.
         thread::sleep(Duration::from_millis(100));
         control.stop();
         let applied = handle.join().expect("join feeder");
 
-        assert!(applied < 3, "stop should abort before all messages applied");
+        assert_eq!(
+            applied, 1,
+            "exactly the first (gap-free) message applies before stop"
+        );
     }
 
     #[test]
@@ -378,7 +429,10 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         control.stop();
         let applied = handle.join().expect("feeder must not panic or hang");
-        assert!(applied < 2, "stop should abort before the second message");
+        assert_eq!(
+            applied, 1,
+            "exactly the first message applies; stop aborts before the second"
+        );
     }
 
     /// NaN / 0 / negative speed still mean "as fast as possible".

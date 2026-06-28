@@ -217,6 +217,31 @@ mod tests {
         assert_eq!(read, original);
     }
 
+    /// Record → read → re-record → read must reproduce the original stream
+    /// exactly (seq, microsecond timestamp, payload) — the on-disk format is a
+    /// faithful, idempotent round-trip.
+    #[test]
+    fn record_read_rerecord_is_identity() {
+        let dir1 = tempdir().expect("tempdir1");
+        let original = sample_stream();
+        record_stream(dir1.path(), &original);
+
+        let read1: Vec<Message<SampleEvent>> = SessionReader::<SampleEvent>::open(dir1.path())
+            .expect("open1")
+            .collect::<Result<_, _>>()
+            .expect("read1");
+        assert_eq!(read1, original);
+
+        let dir2 = tempdir().expect("tempdir2");
+        record_stream(dir2.path(), &read1);
+
+        let read2: Vec<Message<SampleEvent>> = SessionReader::<SampleEvent>::open(dir2.path())
+            .expect("open2")
+            .collect::<Result<_, _>>()
+            .expect("read2");
+        assert_eq!(read2, original);
+    }
+
     #[test]
     fn yields_seq_order_across_parts() {
         let dir = tempdir().expect("tempdir");

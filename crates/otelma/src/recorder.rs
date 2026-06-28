@@ -417,4 +417,100 @@ mod tests {
         .expect("second");
         rec.close().expect("close");
     }
+
+    /// Row counts of each part file in `dir`, in ascending part order.
+    fn part_row_counts(dir: &std::path::Path) -> Vec<usize> {
+        list_parts(dir)
+            .iter()
+            .map(|p| {
+                let file = fs::File::open(p).expect("open part");
+                ParquetRecordBatchReaderBuilder::try_new(file)
+                    .expect("reader builder")
+                    .build()
+                    .expect("reader")
+                    .map(|b| b.expect("batch").num_rows())
+                    .sum::<usize>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn max_rows_rolls_early_within_same_hour() {
+        use crate::SessionReader;
+
+        let dir = tempdir().expect("tempdir");
+        let mut rec = Recorder::with_max_rows(dir.path(), 2).expect("recorder");
+
+        // Five messages, all in the SAME utc hour — only the row cap rolls.
+        let msgs: Vec<Message<SampleEvent>> = (0..5)
+            .map(|i| Message::new(i, ts(&format!("2026-01-01T10:00:0{i}Z")), SampleEvent::Tick))
+            .collect();
+        for m in &msgs {
+            rec.record(m).expect("record");
+        }
+        rec.close().expect("close");
+
+        // cap=2 → [2, 2, 1].
+        assert_eq!(part_row_counts(dir.path()), vec![2, 2, 1]);
+
+        // Full round-trip still yields all five in order.
+        let reader = SessionReader::<SampleEvent>::open(dir.path()).expect("open");
+        let read: Vec<Message<SampleEvent>> = reader.collect::<Result<_, _>>().expect("read");
+        assert_eq!(read, msgs);
+    }
+
+    #[test]
+    fn max_rows_and_hour_change_produce_no_empty_part() {
+        use crate::SessionReader;
+
+        let dir = tempdir().expect("tempdir");
+        let mut rec = Recorder::with_max_rows(dir.path(), 2).expect("recorder");
+
+        // Two messages fill hour 10 to the cap; the third both starts a new hour
+        // AND would trip the cap. The recorder must not emit an empty/zero-row
+        // part for the double trigger.
+        let msgs = vec![
+            Message::new(0, ts("2026-01-01T10:00:00Z"), SampleEvent::Tick),
+            Message::new(1, ts("2026-01-01T10:30:00Z"), SampleEvent::Tick),
+            Message::new(2, ts("2026-01-01T11:00:00Z"), SampleEvent::Tick),
+        ];
+        for m in &msgs {
+            rec.record(m).expect("record");
+        }
+        rec.close().expect("close");
+
+        let counts = part_row_counts(dir.path());
+        assert!(
+            counts.iter().all(|&n| n > 0),
+            "no empty part files: {counts:?}"
+        );
+        assert_eq!(counts.iter().sum::<usize>(), 3, "all rows present");
+
+        let reader = SessionReader::<SampleEvent>::open(dir.path()).expect("open");
+        let read: Vec<Message<SampleEvent>> = reader.collect::<Result<_, _>>().expect("read");
+        assert_eq!(read, msgs);
+    }
+
+    #[test]
+    fn hour_boundary_precision_splits_at_microsecond() {
+        let dir = tempdir().expect("tempdir");
+        let mut rec = Recorder::new(dir.path()).expect("recorder");
+
+        // Last microsecond of hour 10, then first microsecond of hour 11.
+        rec.record(&Message::new(
+            0,
+            ts("2026-01-01T10:59:59.999999Z"),
+            SampleEvent::Tick,
+        ))
+        .expect("record hour 10");
+        rec.record(&Message::new(
+            1,
+            ts("2026-01-01T11:00:00.000000Z"),
+            SampleEvent::Tick,
+        ))
+        .expect("record hour 11");
+        rec.close().expect("close");
+
+        assert_eq!(part_row_counts(dir.path()), vec![1, 1]);
+    }
 }
