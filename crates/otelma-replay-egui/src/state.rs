@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use otelma::{Message, Sink};
-use otelma_polymarket::{AssetId, Level, PolyEvent, Price, Side};
+use otelma_polymarket::{AssetId, BookUpdate, PolyEvent, Side};
 
 /// One sample of an asset's top-of-book over time (plot point).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,11 +75,12 @@ impl ReplayState {
     }
 }
 
-/// Best bid = max bid price; best ask = min ask price. Computed as extrema so we
-/// never assume which end of the venue's level vec is top-of-book.
-fn best_bid_ask(bids: &[Level], asks: &[Level]) -> Option<(f64, f64)> {
-    let best_bid: Price = bids.iter().map(|l| l.price).max()?;
-    let best_ask: Price = asks.iter().map(|l| l.price).min()?;
+/// Top-of-book as `(best_bid, best_ask)` f64s for plotting, or `None` if either
+/// side is empty. Extrema come from [`BookUpdate::best_bid`] /
+/// [`BookUpdate::best_ask`].
+fn best_bid_ask(book: &BookUpdate) -> Option<(f64, f64)> {
+    let best_bid = book.best_bid()?;
+    let best_ask = book.best_ask()?;
     Some((
         decimal_to_f64(best_bid.value()),
         decimal_to_f64(best_ask.value()),
@@ -127,7 +128,7 @@ impl Sink<PolyEvent> for GuiSink<'_> {
         match &msg.payload {
             PolyEvent::Book(book) => {
                 let asset = self.state.assets.entry(book.asset_id.clone()).or_default();
-                if let Some((best_bid, best_ask)) = best_bid_ask(&book.bids, &book.asks) {
+                if let Some((best_bid, best_ask)) = best_bid_ask(book) {
                     asset.book_series.push(BookPoint {
                         t_secs,
                         best_bid,
@@ -178,40 +179,8 @@ impl Sink<PolyEvent> for GuiSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
-    use otelma_polymarket::{BookUpdate, Size, Trade};
+    use otelma_polymarket::testing::{book_msg, dt, lvl, trade_msg};
     use rust_decimal_macros::dec;
-
-    fn dt(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).single().expect("ts")
-    }
-
-    fn book_msg(
-        seq: u64,
-        secs: i64,
-        asset: &str,
-        bids: Vec<Level>,
-        asks: Vec<Level>,
-    ) -> Message<PolyEvent> {
-        Message::new(
-            seq,
-            dt(secs),
-            PolyEvent::Book(BookUpdate {
-                asset_id: asset.into(),
-                bids,
-                asks,
-                market: None,
-                exchange_ts_millis: None,
-            }),
-        )
-    }
-
-    fn lvl(price: rust_decimal::Decimal, size: rust_decimal::Decimal) -> Level {
-        Level {
-            price: Price::new(price).expect("non-negative price"),
-            size: Size::new(size).expect("non-negative size"),
-        }
-    }
 
     #[test]
     fn sink_accumulates_book_series_with_extrema() {
@@ -263,27 +232,16 @@ mod tests {
                 vec![lvl(dec!(0.5), dec!(1))],
                 vec![lvl(dec!(0.6), dec!(1))],
             ));
-            sink.apply(&Message::new(
+            sink.apply(&trade_msg(
                 1,
-                dt(30),
-                PolyEvent::Trade(Trade {
-                    asset_id: "A".into(),
-                    price: Some(Price::new(dec!(0.55)).expect("price")),
-                    size: Some(Size::new(dec!(2)).expect("size")),
-                    side: Some(Side::Buy),
-                }),
+                30,
+                "A",
+                Some(dec!(0.55)),
+                Some(dec!(2)),
+                Some(Side::Buy),
             ));
             // A trade without a price is not plotted.
-            sink.apply(&Message::new(
-                2,
-                dt(31),
-                PolyEvent::Trade(Trade {
-                    asset_id: "A".into(),
-                    price: None,
-                    size: None,
-                    side: None,
-                }),
-            ));
+            sink.apply(&trade_msg(2, 31, "A", None, None, None));
         }
 
         let a = &state.assets[&AssetId::from("A")];

@@ -208,28 +208,10 @@ impl Default for PlaybackControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Payload;
     use crate::reader::SessionReader;
-    use crate::recorder::Recorder;
-    use serde::{Deserialize, Serialize};
-    use std::path::Path;
+    use crate::test_support::{record_stream, sample_stream, ts, SampleEvent};
     use std::sync::Arc;
     use tempfile::tempdir;
-
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-    enum SampleEvent {
-        Tick,
-        Book { bid: i64, ask: i64 },
-    }
-
-    impl Payload for SampleEvent {
-        fn type_name(&self) -> &'static str {
-            match self {
-                SampleEvent::Tick => "Tick",
-                SampleEvent::Book { .. } => "Book",
-            }
-        }
-    }
 
     /// A sink that records every applied message in order.
     #[derive(Default)]
@@ -241,32 +223,6 @@ mod tests {
         fn apply(&mut self, msg: &Message<SampleEvent>) {
             self.applied.push(msg.clone());
         }
-    }
-
-    fn ts(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s)
-            .expect("valid rfc3339")
-            .with_timezone(&Utc)
-    }
-
-    fn sample_stream() -> Vec<Message<SampleEvent>> {
-        vec![
-            Message::new(0, ts("2026-01-01T10:00:00Z"), SampleEvent::Tick),
-            Message::new(
-                1,
-                ts("2026-01-01T10:30:00Z"),
-                SampleEvent::Book { bid: 1, ask: 2 },
-            ),
-            Message::new(2, ts("2026-01-01T11:00:00Z"), SampleEvent::Tick),
-        ]
-    }
-
-    fn record_stream(dir: &Path, msgs: &[Message<SampleEvent>]) {
-        let mut rec = Recorder::new(dir).expect("recorder");
-        for m in msgs {
-            rec.record(m).expect("record");
-        }
-        rec.close().expect("close");
     }
 
     #[test]

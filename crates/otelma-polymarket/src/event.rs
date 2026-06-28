@@ -43,6 +43,24 @@ pub struct BookUpdate {
     pub exchange_ts_millis: Option<i64>,
 }
 
+impl BookUpdate {
+    /// Best bid = the highest bid price, or `None` if there are no bids.
+    ///
+    /// Computed as the extremum so we never assume which end of the venue's
+    /// level vec is top-of-book.
+    pub fn best_bid(&self) -> Option<Price> {
+        self.bids.iter().map(|l| l.price).max()
+    }
+
+    /// Best ask = the lowest ask price, or `None` if there are no asks.
+    ///
+    /// Computed as the extremum so we never assume which end of the venue's
+    /// level vec is top-of-book.
+    pub fn best_ask(&self) -> Option<Price> {
+        self.asks.iter().map(|l| l.price).min()
+    }
+}
+
 /// A trade event for one asset (venue `last_trade_price`): a trade occurred.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trade {
@@ -140,6 +158,51 @@ mod tests {
         assert_eq!(trade.type_name(), "Trade");
         assert_eq!(price_change.type_name(), "PriceChange");
         assert_eq!(conn.type_name(), "Connection");
+    }
+
+    #[test]
+    fn best_bid_ask_are_extrema_regardless_of_order() {
+        let book = BookUpdate {
+            asset_id: "a".into(),
+            // Levels given out of order — extrema must still be correct.
+            bids: vec![
+                Level {
+                    price: price(dec!(0.50)),
+                    size: size(dec!(1)),
+                },
+                Level {
+                    price: price(dec!(0.52)),
+                    size: size(dec!(1)),
+                },
+            ],
+            asks: vec![
+                Level {
+                    price: price(dec!(0.55)),
+                    size: size(dec!(1)),
+                },
+                Level {
+                    price: price(dec!(0.54)),
+                    size: size(dec!(1)),
+                },
+            ],
+            market: None,
+            exchange_ts_millis: None,
+        };
+        assert_eq!(book.best_bid(), Some(price(dec!(0.52))));
+        assert_eq!(book.best_ask(), Some(price(dec!(0.54))));
+    }
+
+    #[test]
+    fn best_bid_ask_empty_book_is_none() {
+        let book = BookUpdate {
+            asset_id: "a".into(),
+            bids: vec![],
+            asks: vec![],
+            market: None,
+            exchange_ts_millis: None,
+        };
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), None);
     }
 
     /// The headline serde-config guard: awkward decimals must survive the

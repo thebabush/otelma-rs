@@ -134,7 +134,7 @@ fn interpret(raw: RawEvent) -> Result<Option<PolyEvent>, ParseError> {
             bids: parse_levels(raw.bids)?,
             asks: parse_levels(raw.asks)?,
             market: raw.market.map(MarketId::from),
-            exchange_ts_millis: raw.timestamp.map(ts_to_millis),
+            exchange_ts_millis: raw.timestamp.and_then(ts_to_millis),
         }))),
         "last_trade_price" => Ok(Some(PolyEvent::Trade(Trade {
             asset_id: AssetId::from(asset_id),
@@ -194,13 +194,13 @@ fn parse_side(s: &str) -> Option<Side> {
     }
 }
 
-/// Coerce a string-or-number timestamp to millis. A non-numeric string parses
-/// to 0 (the venue's timestamps are always numeric in practice; we tolerate the
-/// quoting rather than crash).
-fn ts_to_millis(ts: StrOrNum) -> i64 {
+/// Coerce a string-or-number timestamp to millis. A non-numeric string yields
+/// `None` rather than a fabricated `0` — consistent with `exchange_ts_millis`
+/// already being optional, so garbage surfaces as "absent" not "epoch 0".
+fn ts_to_millis(ts: StrOrNum) -> Option<i64> {
     match ts {
-        StrOrNum::Int(n) => n,
-        StrOrNum::Str(s) => s.parse().unwrap_or(0),
+        StrOrNum::Int(n) => Some(n),
+        StrOrNum::Str(s) => s.parse().ok(),
     }
 }
 
@@ -266,6 +266,16 @@ mod tests {
             panic!("expected Book");
         };
         assert_eq!(book.exchange_ts_millis, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn unparseable_timestamp_is_none_not_zero() {
+        let raw = r#"{"event_type":"book","asset_id":"t","timestamp":"not-a-number","bids":[],"asks":[]}"#;
+        let events = parse_ws_frame(raw).expect("parse");
+        let PolyEvent::Book(book) = &events[0] else {
+            panic!("expected Book");
+        };
+        assert_eq!(book.exchange_ts_millis, None);
     }
 
     #[test]

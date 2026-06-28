@@ -34,6 +34,15 @@ pub fn part_schema() -> Arc<Schema> {
     ]))
 }
 
+/// The Parquet writer properties used for all part files: ZSTD compression.
+/// Shared by the [`crate::Recorder`] (per-part flushes) and [`compact_session`]
+/// so the on-disk codec is defined in exactly one place.
+pub(crate) fn zstd_writer_props() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build()
+}
+
 /// Discover the `part-*.parquet` files in `session_dir`, in ascending part
 /// order (zero-padded names sort lexically into numeric order). Only files
 /// named `part-*.parquet` are included — other parquet files in the directory
@@ -66,12 +75,8 @@ fn is_part_file(path: &Path) -> bool {
 /// The result round-trips: reading it back yields the identical message stream.
 pub fn compact_session(session_dir: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<(), Error> {
     let parts = part_paths(session_dir)?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
-        .build();
-
     let file = std::fs::File::create(out)?;
-    let mut writer = ArrowWriter::try_new(file, part_schema(), Some(props))?;
+    let mut writer = ArrowWriter::try_new(file, part_schema(), Some(zstd_writer_props()))?;
 
     for path in parts {
         let part = std::fs::File::open(path)?;

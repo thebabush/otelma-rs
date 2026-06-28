@@ -6,6 +6,11 @@ description = "Batteries-included Polymarket CLOB payload + WS frame parser for 
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/babush/otelma"
 
+[features]
+# Exposes the test builders in `testing.rs` to downstream crates as a
+# dev-dependency, so their test suites reuse one set of PolyEvent builders.
+testing = []
+
 [dependencies]
 otelma = { path = "../otelma" }
 serde = { version = "1.0", features = ["derive"] }

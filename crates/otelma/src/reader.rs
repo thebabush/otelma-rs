@@ -200,56 +200,8 @@ fn column<'a, A: Array + 'static>(
 mod tests {
     use super::*;
     use crate::message::Payload;
-    use crate::recorder::Recorder;
-    use serde::{Deserialize, Serialize};
+    use crate::test_support::{record_stream, sample_stream, ts, SampleEvent};
     use tempfile::tempdir;
-
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-    enum SampleEvent {
-        Tick,
-        Book { bid: i64, ask: i64 },
-    }
-
-    impl Payload for SampleEvent {
-        fn type_name(&self) -> &'static str {
-            match self {
-                SampleEvent::Tick => "Tick",
-                SampleEvent::Book { .. } => "Book",
-            }
-        }
-    }
-
-    fn ts(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s)
-            .expect("valid rfc3339")
-            .with_timezone(&Utc)
-    }
-
-    fn sample_stream() -> Vec<Message<SampleEvent>> {
-        vec![
-            Message::new(0, ts("2026-01-01T10:00:00Z"), SampleEvent::Tick),
-            Message::new(
-                1,
-                ts("2026-01-01T10:30:00.123456Z"),
-                SampleEvent::Book { bid: 1, ask: 2 },
-            ),
-            Message::new(2, ts("2026-01-01T10:59:59Z"), SampleEvent::Tick),
-            Message::new(3, ts("2026-01-01T11:00:00Z"), SampleEvent::Tick),
-            Message::new(
-                4,
-                ts("2026-01-01T11:15:00Z"),
-                SampleEvent::Book { bid: 3, ask: 4 },
-            ),
-        ]
-    }
-
-    fn record_stream(dir: &Path, msgs: &[Message<SampleEvent>]) {
-        let mut rec = Recorder::new(dir).expect("recorder");
-        for m in msgs {
-            rec.record(m).expect("record");
-        }
-        rec.close().expect("close");
-    }
 
     #[test]
     fn round_trip_across_parts() {

@@ -19,14 +19,13 @@ use arrow::array::{ArrayRef, BinaryArray, StringArray, TimestampMicrosecondArray
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use crate::codec::encode_payload;
 use crate::error::Error;
 use crate::message::{Message, Payload};
 use crate::monotonic::Monotonicity;
-use crate::parts::part_schema;
+use crate::parts::{part_schema, zstd_writer_props};
 
 /// Default safety cap on buffered rows before forcing an early roll.
 const DEFAULT_MAX_ROWS: usize = 2_000_000;
@@ -112,9 +111,7 @@ impl Recorder {
     pub fn with_max_rows(session_dir: impl Into<PathBuf>, max_rows: usize) -> Result<Self, Error> {
         let session_dir = session_dir.into();
         fs::create_dir_all(&session_dir)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(Default::default()))
-            .build();
+        let props = zstd_writer_props();
         Ok(Self {
             session_dir,
             part_idx: PartIndex::first(),
@@ -179,11 +176,15 @@ impl Recorder {
                 .collect::<Vec<_>>(),
         ));
 
-        let batch = RecordBatch::try_new(part_schema(), vec![seq, timestamp, type_name, payload])?;
+        let schema = part_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![seq, timestamp, type_name, payload],
+        )?;
 
         let path = self.session_dir.join(self.part_idx.file_name());
         let file = fs::File::create(path)?;
-        let mut writer = ArrowWriter::try_new(file, part_schema(), Some(self.props.clone()))?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(self.props.clone()))?;
         writer.write(&batch)?;
         writer.close()?;
         Ok(())
@@ -199,31 +200,10 @@ impl Recorder {
 mod tests {
     use super::*;
     use crate::codec::decode_payload;
+    use crate::test_support::{ts, SampleEvent};
     use arrow::datatypes::{DataType, TimeUnit};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use serde::{Deserialize, Serialize};
     use tempfile::tempdir;
-
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-    enum SampleEvent {
-        Tick,
-        Book { bid: i64, ask: i64 },
-    }
-
-    impl Payload for SampleEvent {
-        fn type_name(&self) -> &'static str {
-            match self {
-                SampleEvent::Tick => "Tick",
-                SampleEvent::Book { .. } => "Book",
-            }
-        }
-    }
-
-    fn ts(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s)
-            .expect("valid rfc3339")
-            .with_timezone(&Utc)
-    }
 
     fn list_parts(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut parts: Vec<PathBuf> = fs::read_dir(dir)

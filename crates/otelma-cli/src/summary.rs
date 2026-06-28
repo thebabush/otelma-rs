@@ -120,11 +120,8 @@ impl Sink<PolyEvent> for SummarySink {
         match &msg.payload {
             PolyEvent::Book(book) => {
                 let entry = self.per_asset.entry(book.asset_id.clone()).or_default();
-                // The venue's level ordering is carried as received; don't assume
-                // a side of the vec — compute the extremum: best bid is the max
-                // price, best ask the min price.
-                entry.best_bid = book.bids.iter().map(|l| l.price).max();
-                entry.best_ask = book.asks.iter().map(|l| l.price).min();
+                entry.best_bid = book.best_bid();
+                entry.best_ask = book.best_ask();
             }
             PolyEvent::Trade(trade) => {
                 let entry = self.per_asset.entry(trade.asset_id.clone()).or_default();
@@ -156,8 +153,8 @@ fn fmt_side(side: Option<Side>) -> &'static str {
 pub fn render_line(msg: &Message<PolyEvent>) -> String {
     let (ty, detail) = match &msg.payload {
         PolyEvent::Book(b) => {
-            let bid = b.bids.iter().map(|l| l.price).max();
-            let ask = b.asks.iter().map(|l| l.price).min();
+            let bid = b.best_bid();
+            let ask = b.best_ask();
             (
                 "Book",
                 format!(
@@ -206,60 +203,23 @@ pub fn render_line(msg: &Message<PolyEvent>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otelma_polymarket::{BookUpdate, Level, PriceChange, Size, Trade};
+    use otelma_polymarket::testing::{book_msg as book, dt, lvl, trade_msg};
+    use otelma_polymarket::{PriceChange, Size};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
-    fn dt(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(secs, 0).expect("valid")
-    }
-
     fn price(d: Decimal) -> Price {
         Price::new(d).expect("non-negative")
-    }
-
-    fn lvl(p: Decimal, s: Decimal) -> Level {
-        Level {
-            price: price(p),
-            size: Size::new(s).expect("non-negative"),
-        }
     }
 
     fn asset(id: &str) -> AssetId {
         AssetId::from(id)
     }
 
-    fn book(
-        seq: u64,
-        secs: i64,
-        id: &str,
-        bids: Vec<Level>,
-        asks: Vec<Level>,
-    ) -> Message<PolyEvent> {
-        Message::new(
-            seq,
-            dt(secs),
-            PolyEvent::Book(BookUpdate {
-                asset_id: id.into(),
-                bids,
-                asks,
-                market: None,
-                exchange_ts_millis: None,
-            }),
-        )
-    }
-
+    /// A `Trade` message with a fixed size/side — only the price varies in the
+    /// summary tests.
     fn trade(seq: u64, secs: i64, id: &str, p: Option<Decimal>) -> Message<PolyEvent> {
-        Message::new(
-            seq,
-            dt(secs),
-            PolyEvent::Trade(Trade {
-                asset_id: id.into(),
-                price: p.map(price),
-                size: Some(Size::new(dec!(1)).expect("non-negative")),
-                side: Some(Side::Buy),
-            }),
-        )
+        trade_msg(seq, secs, id, p, Some(dec!(1)), Some(Side::Buy))
     }
 
     #[test]

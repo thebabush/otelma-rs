@@ -49,22 +49,7 @@ pub trait Payload: Serialize {
 mod tests {
     use super::*;
     use crate::codec::{decode_payload, encode_payload};
-
-    /// A sample domain payload used to exercise the generic envelope and codec.
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-    enum SampleEvent {
-        Tick,
-        Book { bid: i64, ask: i64 },
-    }
-
-    impl Payload for SampleEvent {
-        fn type_name(&self) -> &'static str {
-            match self {
-                SampleEvent::Tick => "Tick",
-                SampleEvent::Book { .. } => "Book",
-            }
-        }
-    }
+    use crate::test_support::SampleEvent;
 
     #[test]
     fn payload_type_name() {

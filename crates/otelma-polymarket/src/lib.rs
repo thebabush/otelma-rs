@@ -12,6 +12,9 @@ mod event;
 mod parser;
 mod types;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 pub use client::{subscribe_message, Error, PolymarketClient, Stamper, DEFAULT_URL};
 pub use event::{BookUpdate, Level, PolyEvent, PriceChange, Side, Trade};
 pub use parser::{parse_ws_frame, ParseError};

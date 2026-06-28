@@ -18,6 +18,9 @@ mod reader;
 mod recorder;
 mod replay;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use codec::{decode_payload, encode_payload};
 pub use error::Error;
 pub use message::{Message, Payload};

@@ -170,11 +170,13 @@ impl<C: Fn() -> DateTime<Utc>> PolymarketClient<C> {
             }
 
             let mut was_connected = false;
+            let mut saw_data = false;
             let session = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return Ok(()),
                 result = run_session(
-                    &url, &asset_ids, &tx, &mut stamper, &shutdown, &mut was_connected,
+                    &url, &asset_ids, &tx, &mut stamper, &shutdown,
+                    &mut was_connected, &mut saw_data,
                 ) => result,
             };
 
@@ -182,8 +184,13 @@ impl<C: Fn() -> DateTime<Utc>> PolymarketClient<C> {
                 Ok(SessionEnd::Shutdown) => return Ok(()),
                 Ok(SessionEnd::ChannelClosed) => return Err(Error::ChannelClosed),
                 Ok(SessionEnd::Disconnected) => {
-                    // Successful connect happened; reset backoff before retrying.
-                    backoff = BACKOFF_MIN;
+                    // Only reset the backoff after a *stable* session — one that
+                    // actually delivered real data. A server that accepts then
+                    // instantly closes (no data) must keep backing off, so a
+                    // flapping endpoint isn't hammered at 1 Hz.
+                    if saw_data {
+                        backoff = BACKOFF_MIN;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "polymarket ws session error; reconnecting");
@@ -210,7 +217,7 @@ impl<C: Fn() -> DateTime<Utc>> PolymarketClient<C> {
                 _ = shutdown.cancelled() => return Ok(()),
                 _ = tokio::time::sleep(backoff) => {}
             }
-            backoff = (backoff * 2).min(BACKOFF_MAX);
+            backoff = backoff.saturating_mul(2).min(BACKOFF_MAX);
         }
     }
 }
@@ -224,6 +231,7 @@ async fn run_session<C: Fn() -> DateTime<Utc>>(
     stamper: &mut Stamper<C>,
     shutdown: &CancellationToken,
     was_connected: &mut bool,
+    saw_data: &mut bool,
 ) -> Result<SessionEnd, Error> {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url).await?;
 
@@ -252,7 +260,7 @@ async fn run_session<C: Fn() -> DateTime<Utc>>(
                 match frame {
                     None => return Ok(SessionEnd::Disconnected),
                     Some(frame) => {
-                        if !handle_frame(frame?, tx, stamper).await? {
+                        if !handle_frame(frame?, tx, stamper, saw_data).await? {
                             return Ok(SessionEnd::ChannelClosed);
                         }
                     }
@@ -267,6 +275,7 @@ async fn handle_frame<C: Fn() -> DateTime<Utc>>(
     frame: WsMessage,
     tx: &mpsc::Sender<Message<PolyEvent>>,
     stamper: &mut Stamper<C>,
+    saw_data: &mut bool,
 ) -> Result<bool, Error> {
     let text = match frame {
         WsMessage::Text(t) => t.to_string(),
@@ -297,6 +306,10 @@ async fn handle_frame<C: Fn() -> DateTime<Utc>>(
     };
 
     for event in events {
+        // Every event the parser produces is real venue data (Book / Trade /
+        // PriceChange — never a synthetic Connection), so reaching here means
+        // the session delivered data and is "stable".
+        *saw_data = true;
         if emit(tx, stamper.stamp(event)).await.is_err() {
             return Ok(false);
         }
@@ -416,14 +429,20 @@ mod tests {
             r#"{"event_type":"book","asset_id":"t","bids":[{"price":"NaN","size":"1"}],"asks":[]}"#;
         let (tx, mut rx) = mpsc::channel(4);
         let mut stamper = Stamper::new(|| dt(1));
+        let mut saw_data = false;
 
-        let kept_alive = handle_frame(WsMessage::text(corrupt), &tx, &mut stamper)
+        let kept_alive = handle_frame(WsMessage::text(corrupt), &tx, &mut stamper, &mut saw_data)
             .await
             .expect("handle_frame ok");
 
         assert!(kept_alive, "corrupt frame must not tear down the session");
         // Nothing emitted, and seq counter untouched.
         assert!(rx.try_recv().is_err(), "no message should be emitted");
+        // A corrupt-known frame delivers no real data → not a stable session.
+        assert!(
+            !saw_data,
+            "skipped frame must not mark the session as stable"
+        );
     }
 
     #[tokio::test]
@@ -432,8 +451,9 @@ mod tests {
             r#"{"event_type":"book","asset_id":"t","bids":[{"price":"0.5","size":"1"}],"asks":[]}"#;
         let (tx, mut rx) = mpsc::channel(4);
         let mut stamper = Stamper::new(|| dt(7));
+        let mut saw_data = false;
 
-        let kept_alive = handle_frame(WsMessage::text(book), &tx, &mut stamper)
+        let kept_alive = handle_frame(WsMessage::text(book), &tx, &mut stamper, &mut saw_data)
             .await
             .expect("handle_frame ok");
 
@@ -441,6 +461,8 @@ mod tests {
         let msg = rx.try_recv().expect("one message");
         assert_eq!(msg.seq, 0);
         assert!(matches!(msg.payload, PolyEvent::Book(_)));
+        // Real data delivered → the session counts as stable.
+        assert!(saw_data, "an emitted event must mark the session as stable");
     }
 
     /// Spin up a local WS server that accepts one connection, expects the

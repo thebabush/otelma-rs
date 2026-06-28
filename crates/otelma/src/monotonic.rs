@@ -40,10 +40,7 @@ impl Monotonicity {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn dt(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(secs, 0).expect("valid")
-    }
+    use crate::test_support::dt;
 
     #[test]
     fn accepts_increasing() {
