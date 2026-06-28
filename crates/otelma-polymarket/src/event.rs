@@ -43,7 +43,7 @@ pub struct BookUpdate {
     pub exchange_ts_millis: Option<i64>,
 }
 
-/// A trade / last-price event for one asset.
+/// A trade event for one asset (venue `last_trade_price`): a trade occurred.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Trade {
     /// The venue token id this trade is for.
@@ -52,7 +52,24 @@ pub struct Trade {
     pub price: Option<Price>,
     /// Trade size, if reported.
     pub size: Option<Size>,
-    /// Aggressor side, if reported and recognized.
+    /// The venue-reported side of the last trade, if present and recognized.
+    pub side: Option<Side>,
+}
+
+/// A book-change event for one asset (venue `price_change`): a level of the
+/// order book changed. This is distinct from a [`Trade`] — no trade necessarily
+/// occurred — so it must not be counted or plotted as one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PriceChange {
+    /// The venue token id this change is for.
+    pub asset_id: AssetId,
+    /// The new price of the changed level, if reported.
+    pub price: Option<Price>,
+    /// The new size of the changed level, if reported.
+    pub size: Option<Size>,
+    /// The venue-reported side of the book level that changed, if present and
+    /// recognized. We intentionally do not interpret this further (e.g. as
+    /// bid/ask) without observed data confirming its meaning.
     pub side: Option<Side>,
 }
 
@@ -61,8 +78,10 @@ pub struct Trade {
 pub enum PolyEvent {
     /// An order-book snapshot.
     Book(BookUpdate),
-    /// A trade / last-price update.
+    /// A trade / last-price update (venue `last_trade_price`).
     Trade(Trade),
+    /// A book-level change (venue `price_change`) — not a trade.
+    PriceChange(PriceChange),
     /// A connection-state change emitted by the WS adapter (not the parser).
     Connection {
         /// Whether the venue connection is up.
@@ -75,6 +94,7 @@ impl Payload for PolyEvent {
         match self {
             PolyEvent::Book(_) => "Book",
             PolyEvent::Trade(_) => "Trade",
+            PolyEvent::PriceChange(_) => "PriceChange",
             PolyEvent::Connection { .. } => "Connection",
         }
     }
@@ -109,9 +129,16 @@ mod tests {
             size: None,
             side: None,
         });
+        let price_change = PolyEvent::PriceChange(PriceChange {
+            asset_id: "a".into(),
+            price: None,
+            size: None,
+            side: None,
+        });
         let conn = PolyEvent::Connection { connected: true };
         assert_eq!(book.type_name(), "Book");
         assert_eq!(trade.type_name(), "Trade");
+        assert_eq!(price_change.type_name(), "PriceChange");
         assert_eq!(conn.type_name(), "Connection");
     }
 

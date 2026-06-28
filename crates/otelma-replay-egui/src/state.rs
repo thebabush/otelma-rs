@@ -166,6 +166,10 @@ impl Sink<PolyEvent> for GuiSink<'_> {
                     });
                 }
             }
+            // A price_change is a book-level change, not a trade — it does not
+            // produce a trade marker. (Book updates already drive the plotted
+            // top-of-book series via PolyEvent::Book.)
+            PolyEvent::PriceChange(_) => {}
             PolyEvent::Connection { .. } => {}
         }
     }

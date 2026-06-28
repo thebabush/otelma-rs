@@ -15,7 +15,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::event::{BookUpdate, Level, PolyEvent, Side, Trade};
+use crate::event::{BookUpdate, Level, PolyEvent, PriceChange, Side, Trade};
 use crate::types::{AssetId, MarketId, Price, Size};
 
 /// Errors from [`parse_ws_frame`].
@@ -136,7 +136,13 @@ fn interpret(raw: RawEvent) -> Result<Option<PolyEvent>, ParseError> {
             market: raw.market.map(MarketId::from),
             exchange_ts_millis: raw.timestamp.map(ts_to_millis),
         }))),
-        "last_trade_price" | "price_change" => Ok(Some(PolyEvent::Trade(Trade {
+        "last_trade_price" => Ok(Some(PolyEvent::Trade(Trade {
+            asset_id: AssetId::from(asset_id),
+            price: parse_price_opt(raw.price.as_deref())?,
+            size: parse_size_opt(raw.size.as_deref())?,
+            side: raw.side.as_deref().and_then(parse_side),
+        }))),
+        "price_change" => Ok(Some(PolyEvent::PriceChange(PriceChange {
             asset_id: AssetId::from(asset_id),
             price: parse_price_opt(raw.price.as_deref())?,
             size: parse_size_opt(raw.size.as_deref())?,
@@ -281,13 +287,26 @@ mod tests {
     }
 
     #[test]
-    fn parses_price_change_with_lowercase_side() {
+    fn parses_price_change_as_its_own_variant() {
         let raw = r#"{"event_type":"price_change","asset_id":"x","price":"0.10","size":"5","side":"sell"}"#;
         let events = parse_ws_frame(raw).expect("parse");
-        let PolyEvent::Trade(trade) = &events[0] else {
-            panic!("expected Trade");
+        let PolyEvent::PriceChange(change) = &events[0] else {
+            panic!("expected PriceChange, got {:?}", events[0]);
         };
-        assert_eq!(trade.side, Some(Side::Sell));
+        assert_eq!(change.asset_id.as_str(), "x");
+        assert_eq!(change.price, Some(price(dec!(0.10))));
+        assert_eq!(change.size, Some(size(dec!(5))));
+        assert_eq!(change.side, Some(Side::Sell));
+    }
+
+    #[test]
+    fn parses_last_trade_price_as_trade_variant() {
+        let raw = r#"{"event_type":"last_trade_price","asset_id":"x","price":"0.10","size":"5","side":"buy"}"#;
+        let events = parse_ws_frame(raw).expect("parse");
+        let PolyEvent::Trade(trade) = &events[0] else {
+            panic!("expected Trade, got {:?}", events[0]);
+        };
+        assert_eq!(trade.side, Some(Side::Buy));
     }
 
     #[test]
