@@ -180,8 +180,9 @@ async fn record_and_display(
         recorder.record(&msg)?;
         count += 1;
         // Poisoned lock means the GUI thread panicked; nothing useful to do.
+        // Live: the displayed series are bounded to the trailing window.
         if let Ok(mut s) = state.lock() {
-            GuiSink::new(&mut s).apply(&msg);
+            GuiSink::new_live(&mut s).apply(&msg);
         }
     }
     Ok(count)

@@ -12,14 +12,15 @@
 use std::time::Instant;
 
 use eframe::egui::{self, Color32, RichText};
-use egui_plot::{Line, MarkerShape, Plot, Points};
 
 use otelma_polymarket::AssetId;
 
 use crate::feeder::Feeder;
 use crate::live::LiveFeeder;
+use crate::series::{SeriesMode, YScale};
 use crate::state::ReplayState;
 use crate::theme::{self, Accent, Mode, Timezone, ViewMode};
+use crate::ui;
 
 /// As-fast-as-possible speed.
 const FAST_SPEED: f64 = f64::INFINITY;
@@ -55,6 +56,15 @@ impl Source {
         }
     }
 
+    /// The chart series windowing for this source: replay keeps the full
+    /// session; live shows the trailing window.
+    fn series_mode(&self) -> SeriesMode {
+        match self {
+            Source::Replay { .. } => SeriesMode::Full,
+            Source::Live { .. } => SeriesMode::Trailing,
+        }
+    }
+
     /// Snapshot the shared state under a short lock, whatever the mode.
     fn snapshot(&self) -> ReplayState {
         let state = match self {
@@ -81,6 +91,8 @@ pub struct ReplayApp {
     view: ViewMode,
     /// Displayed timezone for every timestamp (source is UTC; default LOCAL).
     tz: Timezone,
+    /// Chart Y-axis scaling (`AUTO` fit vs fixed `0–1`).
+    y_scale: YScale,
     /// Whether fonts/visuals have been installed (done on first frame, where we
     /// have a `Context`).
     styled: bool,
@@ -112,6 +124,7 @@ impl ReplayApp {
             selected_asset: None,
             view: ViewMode::Chart,
             tz: Timezone::Local,
+            y_scale: YScale::Auto,
             styled: false,
             started: Instant::now(),
         }
@@ -397,8 +410,8 @@ impl ReplayApp {
         }
     }
 
-    /// CHART body: the existing egui_plot chart + depth, reparented into the
-    /// center. (The bespoke chart painter / order-book ladder land later.)
+    /// CHART body: the bespoke painter chart (center) flanked by the placeholder
+    /// selector (left) and depth grid (right) — those two are replaced in 2b.
     fn chart_body_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
         egui::Panel::right("depth")
             .frame(egui::Frame::default().fill(theme::BG_WINDOW))
@@ -408,8 +421,69 @@ impl ReplayApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(theme::BG_WINDOW))
             .show(ui, |ui| {
-                self.asset_selector_ui(ui, state);
-                self.price_plot_ui(ui, state);
+                self.center_column_ui(ui, state);
+            });
+    }
+
+    /// The CHART view's center column: header (top), volume sub-panel (bottom),
+    /// price chart (fills). The selector remains a temporary inline strip until
+    /// 2b adds the real market sidebar.
+    fn center_column_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
+        let mode = self.source.mode();
+        let accent = theme::accent_for(mode);
+        let series_mode = self.source.series_mode();
+
+        // Temporary asset selector (the real sidebar lands in 2b).
+        self.asset_selector_ui(ui, state);
+
+        let asset = self
+            .selected_asset
+            .as_ref()
+            .and_then(|id| state.assets.get(id));
+        let title = self
+            .selected_asset
+            .as_ref()
+            .map(|id| state.label_for(id))
+            .unwrap_or_else(|| "—".to_string());
+
+        // Chart header (~32px).
+        egui::Panel::top("chart_header")
+            .exact_size(ui::HEADER_H)
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::BG_TOOLBAR)
+                    .inner_margin(egui::Margin::ZERO),
+            )
+            .show(ui, |ui| {
+                self.y_scale = ui::chart_header(ui, accent, &title, asset, self.y_scale);
+            });
+
+        let current_t = current_t_secs(state);
+
+        // The remaining body splits into the price chart (top, fills) and the
+        // volume sub-panel (bottom, fixed). They share one painter and one X
+        // mapping so the bars and the playhead line up exactly.
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(theme::BG_WINDOW))
+            .show(ui, |ui| {
+                let full = ui.max_rect();
+                let split_y = full.bottom() - ui::VOLUME_H;
+                let chart_rect =
+                    egui::Rect::from_min_max(full.min, egui::pos2(full.right(), split_y));
+                let vol_rect = egui::Rect::from_min_max(egui::pos2(full.left(), split_y), full.max);
+                let painter = ui.painter();
+                let xmap = ui::price_chart(
+                    painter,
+                    chart_rect,
+                    accent,
+                    asset,
+                    self.y_scale,
+                    series_mode,
+                    self.tz,
+                    state.start_ts,
+                    current_t,
+                );
+                ui::volume_panel(painter, vol_rect, accent, asset, &xmap, current_t);
             });
     }
 
@@ -449,43 +523,6 @@ impl ReplayApp {
         });
     }
 
-    fn price_plot_ui(&self, ui: &mut egui::Ui, state: &ReplayState) {
-        let Some(asset) = self.selected_asset.as_ref() else {
-            return;
-        };
-        let Some(a) = state.assets.get(asset) else {
-            return;
-        };
-
-        let bid: Vec<[f64; 2]> = a
-            .book_series
-            .iter()
-            .map(|p| [p.t_secs, p.best_bid])
-            .collect();
-        let ask: Vec<[f64; 2]> = a
-            .book_series
-            .iter()
-            .map(|p| [p.t_secs, p.best_ask])
-            .collect();
-        let mid: Vec<[f64; 2]> = a.book_series.iter().map(|p| [p.t_secs, p.mid]).collect();
-        let trades: Vec<[f64; 2]> = a.trades.iter().map(|p| [p.t_secs, p.price]).collect();
-
-        Plot::new("price_plot")
-            .legend(egui_plot::Legend::default())
-            .x_axis_label("t (s)")
-            .y_axis_label("price")
-            .show(ui, |plot_ui| {
-                plot_ui.line(Line::new("best bid", bid));
-                plot_ui.line(Line::new("best ask", ask));
-                plot_ui.line(Line::new("mid", mid));
-                plot_ui.points(
-                    Points::new("trades", trades)
-                        .radius(3.0)
-                        .shape(MarkerShape::Diamond),
-                );
-            });
-    }
-
     fn depth_ui(&self, ui: &mut egui::Ui, state: &ReplayState) {
         ui.label(
             RichText::new("ORDER BOOK")
@@ -517,6 +554,16 @@ impl ReplayApp {
             }
         });
     }
+}
+
+/// The playhead time in seconds since the session start: the latest applied
+/// message timestamp relative to the first. Derived only from recorded message
+/// times (`current_ts`/`start_ts`) — never the wall clock — so it stays on the
+/// determinism path. `None` before any data arrives.
+fn current_t_secs(state: &ReplayState) -> Option<f64> {
+    let start = state.start_ts?;
+    let now = state.current_ts?;
+    Some((now - start).num_milliseconds() as f64 / 1000.0)
 }
 
 impl eframe::App for ReplayApp {

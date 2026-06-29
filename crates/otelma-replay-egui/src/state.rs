@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use otelma::{Message, Sink};
-use otelma_polymarket::{AssetId, BookUpdate, MarketMeta, PolyEvent, Side};
+use otelma_polymarket::{AssetId, BookUpdate, MarketMeta, PolyEvent, Side, Size};
+
+use crate::series::{SeriesMode, LIVE_WINDOW_SECS};
 
 /// One sample of an asset's top-of-book over time (plot point).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -22,6 +24,27 @@ pub struct BookPoint {
     pub best_ask: f64,
     /// Midpoint.
     pub mid: f64,
+    /// Spread (`best_ask - best_bid`), precomputed for the chart header.
+    pub spread: f64,
+}
+
+/// One volume-histogram sample over time (volume sub-panel bar).
+///
+/// "Volume" is the traded/changed size attributed to a single message: the
+/// trade `size` for a `Trade`, and the changed level `size` for a `price_change`
+/// (Polymarket's `price_change` carries the dense, frequent book churn the
+/// prototype's histogram shows; counting both gives the dense look without
+/// fabricating data). Messages with no size carry no volume and are skipped.
+/// `up` is the tick direction at that moment: `true` when the asset's mid did
+/// not fall versus the previous book (`mid >= prev_mid`), `false` otherwise.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumePoint {
+    /// Seconds since the session start (shared X with the price chart).
+    pub t_secs: f64,
+    /// Volume for this sample (a non-negative size).
+    pub volume: f64,
+    /// Tick direction: `true` = up/flat (`mid >= prev`), `false` = down.
+    pub up: bool,
 }
 
 /// One trade marker over time (plot point).
@@ -36,26 +59,66 @@ pub struct TradePoint {
 }
 
 /// Accumulated state for one asset.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AssetState {
     /// Top-of-book series built up as replay progresses.
     pub book_series: Vec<BookPoint>,
     /// Trade markers.
     pub trades: Vec<TradePoint>,
+    /// Volume-histogram samples (one per sized trade / price_change).
+    pub volume: Vec<VolumePoint>,
     /// Latest full book bid levels (as received).
     pub depth_bids: Vec<(f64, f64)>,
     /// Latest full book ask levels (as received).
     pub depth_asks: Vec<(f64, f64)>,
+    /// Mid of the previous top-of-book, for the volume tick-direction (`up`).
+    /// `None` until the first top-of-book.
+    last_mid: Option<f64>,
+    /// Latest tick direction (`mid >= prev_mid`), updated on each book point.
+    /// Volume bars inherit this so they colour with the most recent move.
+    /// Starts `true` (up) before any move is observed.
+    last_dir_up: bool,
+}
+
+impl Default for AssetState {
+    fn default() -> Self {
+        Self {
+            book_series: Vec::new(),
+            trades: Vec::new(),
+            volume: Vec::new(),
+            depth_bids: Vec::new(),
+            depth_asks: Vec::new(),
+            last_mid: None,
+            // No move observed yet reads as up (matches "mid >= prev").
+            last_dir_up: true,
+        }
+    }
+}
+
+impl AssetState {
+    /// The most recent top-of-book sample, if any.
+    pub fn last_book(&self) -> Option<&BookPoint> {
+        self.book_series.last()
+    }
+
+    /// Drop series points older than `min_t` (keep `t_secs >= min_t`). Used in
+    /// live mode to bound the stored series to the trailing window. Series are
+    /// appended in time order, so this trims a prefix.
+    fn trim_before(&mut self, min_t: f64) {
+        self.book_series.retain(|p| p.t_secs >= min_t);
+        self.trades.retain(|p| p.t_secs >= min_t);
+        self.volume.retain(|p| p.t_secs >= min_t);
+    }
 }
 
 /// All state shared between the feeder thread and the GUI.
 ///
-/// KNOWN LIMITATION: the per-asset series (`book_series`/`trades`) grow without
-/// bound — one point per message — and the GUI clones the whole `ReplayState`
-/// each frame. That is fine for a bounded replay, but in `--live` mode a
-/// long-running capture accumulates memory indefinitely and the per-frame clone
-/// gets progressively costlier. The on-disk recording is unaffected. A future fix
-/// is to ring-buffer the *displayed* history (the full data stays on disk).
+/// In `--live` mode the per-asset series are bounded to a trailing window of
+/// message time (see [`GuiSink::new_live`] / [`crate::series::LIVE_WINDOW_SECS`])
+/// so a long capture stays memory-bounded; the on-disk recording is unaffected.
+/// In replay the full session is kept (and the GUI clones the whole
+/// `ReplayState` each frame) — fine for a bounded recording. Full-session
+/// downsampling for scrub-back is deferred.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ReplayState {
     /// Per-asset accumulated series, keyed by asset id (sorted).
@@ -116,12 +179,28 @@ fn decimal_to_f64(d: rust_decimal::Decimal) -> f64 {
 /// [`ReplayState`] for the GUI to render.
 pub struct GuiSink<'a> {
     state: &'a mut ReplayState,
+    /// Whether to keep the full session (replay) or bound to the trailing live
+    /// window. Drives series trimming; everything else is identical.
+    mode: SeriesMode,
 }
 
 impl<'a> GuiSink<'a> {
-    /// Borrow `state` for the duration of a drive.
+    /// Borrow `state` for the duration of a replay drive (full-session series).
     pub fn new(state: &'a mut ReplayState) -> Self {
-        Self { state }
+        Self {
+            state,
+            mode: SeriesMode::Full,
+        }
+    }
+
+    /// Borrow `state` for a live drive: the per-asset series are bounded to the
+    /// trailing [`LIVE_WINDOW_SECS`] of message time so a long capture stays
+    /// memory-bounded. The on-disk recording is unaffected.
+    pub fn new_live(state: &'a mut ReplayState) -> Self {
+        Self {
+            state,
+            mode: SeriesMode::Trailing,
+        }
     }
 
     /// Seconds from the session start to `ts` (0 before the first message).
@@ -129,6 +208,33 @@ impl<'a> GuiSink<'a> {
         match self.state.start_ts {
             Some(start) => (ts - start).num_milliseconds() as f64 / 1000.0,
             None => 0.0,
+        }
+    }
+
+    /// Append one volume sample for `asset` from a `size`, coloured by the
+    /// asset's latest tick direction. A zero/absent size is skipped.
+    fn push_volume(asset: &mut AssetState, t_secs: f64, size: Option<Size>) {
+        let Some(size) = size else { return };
+        let volume = decimal_to_f64(size.value());
+        if !volume.is_finite() || volume <= 0.0 {
+            return;
+        }
+        asset.volume.push(VolumePoint {
+            t_secs,
+            volume,
+            up: asset.last_dir_up,
+        });
+    }
+
+    /// In live mode, drop points older than the trailing window relative to the
+    /// just-applied message time. No-op in replay (full session kept).
+    fn trim_live(&mut self, now_t: f64) {
+        if self.mode != SeriesMode::Trailing {
+            return;
+        }
+        let min_t = now_t - LIVE_WINDOW_SECS;
+        for asset in self.state.assets.values_mut() {
+            asset.trim_before(min_t);
         }
     }
 }
@@ -148,11 +254,19 @@ impl Sink<PolyEvent> for GuiSink<'_> {
             PolyEvent::Book(book) => {
                 let asset = self.state.assets.entry(book.asset_id.clone()).or_default();
                 if let Some((best_bid, best_ask)) = best_bid_ask(book) {
+                    let mid = (best_bid + best_ask) / 2.0;
+                    // Tick direction vs the previous mid (first move reads up).
+                    asset.last_dir_up = match asset.last_mid {
+                        Some(prev) => mid >= prev,
+                        None => true,
+                    };
+                    asset.last_mid = Some(mid);
                     asset.book_series.push(BookPoint {
                         t_secs,
                         best_bid,
                         best_ask,
-                        mid: (best_bid + best_ask) / 2.0,
+                        mid,
+                        spread: best_ask - best_bid,
                     });
                 }
                 asset.depth_bids = book
@@ -177,19 +291,29 @@ impl Sink<PolyEvent> for GuiSink<'_> {
                     .collect();
             }
             PolyEvent::Trade(trade) => {
+                let asset = self.state.assets.entry(trade.asset_id.clone()).or_default();
                 if let Some(price) = trade.price {
-                    let asset = self.state.assets.entry(trade.asset_id.clone()).or_default();
                     asset.trades.push(TradePoint {
                         t_secs,
                         price: decimal_to_f64(price.value()),
                         side: trade.side,
                     });
                 }
+                // The trade's size is real traded volume.
+                Self::push_volume(asset, t_secs, trade.size);
             }
-            // A price_change is a book-level change, not a trade — it does not
-            // produce a trade marker. (Book updates already drive the plotted
-            // top-of-book series via PolyEvent::Book.)
-            PolyEvent::PriceChange(_) => {}
+            // A price_change is a book-level change, not a trade — it produces no
+            // trade marker (top-of-book is driven by PolyEvent::Book). Its
+            // changed size is, however, real book churn: count it as volume so
+            // the histogram reflects the dense price_change stream.
+            PolyEvent::PriceChange(change) => {
+                let asset = self
+                    .state
+                    .assets
+                    .entry(change.asset_id.clone())
+                    .or_default();
+                Self::push_volume(asset, t_secs, change.size);
+            }
             PolyEvent::Connection { .. } => {}
             PolyEvent::Market(meta) => {
                 self.state
@@ -200,6 +324,9 @@ impl Sink<PolyEvent> for GuiSink<'_> {
                     .insert(meta.no_asset_id.clone(), asset_label(meta, "No"));
             }
         }
+
+        // Live mode: bound every asset's stored series to the trailing window.
+        self.trim_live(t_secs);
     }
 }
 
@@ -216,6 +343,7 @@ fn asset_label(meta: &MarketMeta, side: &str) -> String {
 mod tests {
     use super::*;
     use otelma_polymarket::testing::{book_msg, dt, lvl, trade_msg};
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     #[test]
@@ -251,6 +379,7 @@ mod tests {
         assert_eq!(p.best_bid, 0.52);
         assert_eq!(p.best_ask, 0.54);
         assert_eq!(p.mid, 0.53);
+        assert!((p.spread - 0.02).abs() < 1e-9);
         // Depth captured as received (two levels each side).
         assert_eq!(a.depth_bids.len(), 2);
         assert_eq!(a.depth_asks.len(), 2);
@@ -340,5 +469,150 @@ mod tests {
         state.clear();
         assert_eq!(state, ReplayState::default());
         assert!(state.asset_ids().is_empty());
+    }
+
+    /// A `price_change` message for `asset` with a changed `size`.
+    fn price_change_msg(seq: u64, secs: i64, asset: &str, size: Decimal) -> Message<PolyEvent> {
+        use otelma_polymarket::{PriceChange, Size};
+        Message::new(
+            seq,
+            dt(secs),
+            PolyEvent::PriceChange(PriceChange {
+                asset_id: asset.into(),
+                price: None,
+                size: Some(Size::new(size).expect("non-negative size")),
+                side: None,
+            }),
+        )
+    }
+
+    #[test]
+    fn volume_samples_come_from_trade_and_price_change_size() {
+        let mut state = ReplayState::default();
+        {
+            let mut sink = GuiSink::new(&mut state);
+            // A trade with size → one volume sample.
+            sink.apply(&trade_msg(
+                0,
+                0,
+                "A",
+                Some(dec!(0.55)),
+                Some(dec!(7)),
+                Some(Side::Buy),
+            ));
+            // A price_change with size → another volume sample.
+            sink.apply(&price_change_msg(1, 1, "A", dec!(3)));
+            // A trade without a size → no volume sample.
+            sink.apply(&trade_msg(2, 2, "A", Some(dec!(0.55)), None, None));
+        }
+        let a = &state.assets[&AssetId::from("A")];
+        assert_eq!(a.volume.len(), 2);
+        assert_eq!(a.volume[0].volume, 7.0);
+        assert_eq!(a.volume[1].volume, 3.0);
+    }
+
+    #[test]
+    fn volume_up_flag_tracks_mid_tick_direction() {
+        let mut state = ReplayState::default();
+        {
+            let mut sink = GuiSink::new(&mut state);
+            // First book → mid 0.50; a trade now reads as up (no prior move).
+            sink.apply(&book_msg(
+                0,
+                0,
+                "A",
+                vec![lvl(dec!(0.49), dec!(1))],
+                vec![lvl(dec!(0.51), dec!(1))],
+            ));
+            sink.apply(&trade_msg(1, 1, "A", None, Some(dec!(1)), None));
+            // Mid rises to 0.60 → up.
+            sink.apply(&book_msg(
+                2,
+                2,
+                "A",
+                vec![lvl(dec!(0.59), dec!(1))],
+                vec![lvl(dec!(0.61), dec!(1))],
+            ));
+            sink.apply(&trade_msg(3, 3, "A", None, Some(dec!(1)), None));
+            // Mid falls to 0.40 → down.
+            sink.apply(&book_msg(
+                4,
+                4,
+                "A",
+                vec![lvl(dec!(0.39), dec!(1))],
+                vec![lvl(dec!(0.41), dec!(1))],
+            ));
+            sink.apply(&trade_msg(5, 5, "A", None, Some(dec!(1)), None));
+        }
+        let a = &state.assets[&AssetId::from("A")];
+        let ups: Vec<bool> = a.volume.iter().map(|v| v.up).collect();
+        assert_eq!(ups, vec![true, true, false]);
+    }
+
+    #[test]
+    fn replay_mode_keeps_full_session_series() {
+        let mut state = ReplayState::default();
+        {
+            let mut sink = GuiSink::new(&mut state);
+            // Two books an hour apart — replay must keep both.
+            sink.apply(&book_msg(
+                0,
+                0,
+                "A",
+                vec![lvl(dec!(0.5), dec!(1))],
+                vec![lvl(dec!(0.6), dec!(1))],
+            ));
+            sink.apply(&book_msg(
+                1,
+                3600,
+                "A",
+                vec![lvl(dec!(0.5), dec!(1))],
+                vec![lvl(dec!(0.6), dec!(1))],
+            ));
+        }
+        assert_eq!(state.assets[&AssetId::from("A")].book_series.len(), 2);
+    }
+
+    #[test]
+    fn live_mode_trims_series_to_trailing_window() {
+        use crate::series::LIVE_WINDOW_SECS;
+        let mut state = ReplayState::default();
+        {
+            let mut sink = GuiSink::new_live(&mut state);
+            // t=0 book (will fall outside the window once t advances far enough).
+            sink.apply(&book_msg(
+                0,
+                0,
+                "A",
+                vec![lvl(dec!(0.5), dec!(1))],
+                vec![lvl(dec!(0.6), dec!(1))],
+            ));
+            sink.apply(&trade_msg(1, 0, "A", None, Some(dec!(1)), None));
+            // A book inside the window: t = WINDOW - 10.
+            sink.apply(&book_msg(
+                2,
+                LIVE_WINDOW_SECS as i64 - 10,
+                "A",
+                vec![lvl(dec!(0.5), dec!(1))],
+                vec![lvl(dec!(0.6), dec!(1))],
+            ));
+            // Latest message at t = WINDOW + 100 → window floor is t = 100, so
+            // the t=0 book + trade fall out; the t = WINDOW-10 (=170) one stays.
+            sink.apply(&book_msg(
+                3,
+                LIVE_WINDOW_SECS as i64 + 100,
+                "A",
+                vec![lvl(dec!(0.5), dec!(1))],
+                vec![lvl(dec!(0.6), dec!(1))],
+            ));
+        }
+        let a = &state.assets[&AssetId::from("A")];
+        // The two recent books survive (t=170 and t=280); the t=0 ones are gone.
+        assert_eq!(a.book_series.len(), 2);
+        assert!(a.book_series.iter().all(|p| p.t_secs >= 100.0));
+        assert!(
+            a.volume.is_empty(),
+            "the t=0 trade volume should be trimmed"
+        );
     }
 }

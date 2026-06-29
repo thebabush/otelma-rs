@@ -215,6 +215,17 @@ pub fn format_timestamp(ts: DateTime<Utc>, tz: Timezone) -> String {
     }
 }
 
+/// Format a UTC timestamp as a clock time `HH:MM:SS` in the chosen timezone
+/// (the chart/scrubber axis labels). Respects the same LOCAL/UTC toggle as the
+/// full-date [`format_timestamp`].
+pub fn format_clock(ts: DateTime<Utc>, tz: Timezone) -> String {
+    const FMT: &str = "%H:%M:%S";
+    match tz {
+        Timezone::Utc => ts.format(FMT).to_string(),
+        Timezone::Local => ts.with_timezone(&Local).format(FMT).to_string(),
+    }
+}
+
 /// Format the `msg` stat. REPLAY shows `cur / total` when the total is known,
 /// else a running count; LIVE is always a running count.
 pub fn format_msg_stat(mode: Mode, current: u64, total: Option<u64>) -> String {
@@ -312,6 +323,14 @@ mod tests {
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
         assert_eq!(format_timestamp(ts, Timezone::Local), expected);
+    }
+
+    #[test]
+    fn format_clock_utc_is_hms_and_local_matches_chrono() {
+        let ts = Utc.with_ymd_and_hms(2026, 6, 29, 14, 28, 5).unwrap();
+        assert_eq!(format_clock(ts, Timezone::Utc), "14:28:05");
+        let expected = ts.with_timezone(&Local).format("%H:%M:%S").to_string();
+        assert_eq!(format_clock(ts, Timezone::Local), expected);
     }
 
     #[test]
