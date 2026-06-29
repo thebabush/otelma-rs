@@ -60,6 +60,16 @@ pub enum GammaError {
         /// What was wrong.
         detail: String,
     },
+    /// No `--event`, `--market`, or `--asset-id` selector was given at all.
+    #[error("nothing to subscribe to: pass at least one of --event, --market, or --asset-id")]
+    NoSelectors,
+    /// Every matched market was closed or had malformed tokens, so the merge
+    /// produced zero token ids.
+    #[error(
+        "resolved zero token ids — every matched market was closed or had malformed tokens \
+         (try --include-closed for closed ones)"
+    )]
+    NoTokens,
 }
 
 /// One market as returned in a Gamma events/markets response. Only the fields we

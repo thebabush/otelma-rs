@@ -1,13 +1,12 @@
 //! Subcommand implementations. The core of each command is a plain function so
 //! it is testable without going through `clap`/`main`.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use otelma::{compact_session, drive, drive_realtime, PlaybackControl, Recorder, SessionReader};
 use otelma_polymarket::{
-    resolve_event, resolve_market, MarketMeta, PolyEvent, PolymarketClient, Resolution,
+    resolve_subscription, MarketMeta, PolyEvent, PolymarketClient, ResolvedSubscription,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -18,71 +17,12 @@ use crate::summary::{render_line, SummarySink};
 /// stream's own timestamps, not the wall clock).
 const STATUS_INTERVAL_SECS: i64 = 5;
 
-/// Default session directory for `record`: `recordings/<UTC timestamp>/`.
-pub fn default_session_dir(now: chrono::DateTime<chrono::Utc>) -> PathBuf {
-    PathBuf::from("recordings").join(now.format("%Y%m%dT%H%M%SZ").to_string())
-}
-
-/// What to record: the deterministic, deduplicated token-id subscription set
-/// plus the collected per-market metadata to embed at recording start.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedSubscription {
-    /// Sorted, deduplicated token ids to subscribe to.
-    pub token_ids: Vec<String>,
-    /// Per-market metadata, in the resolvers' deterministic order. Raw
-    /// `--asset-id`s contribute tokens but no metadata.
-    pub markets: Vec<MarketMeta>,
-}
-
-/// Merge resolved event/market resolutions with raw asset ids into one sorted,
-/// deduplicated token-id list plus the collected market metadata, and report the
-/// total skipped-closed count.
-///
-/// Pure: takes already-fetched [`Resolution`]s plus the raw `--asset-id` values,
-/// so the merge + deterministic dedup is unit-testable without the network. The
-/// returned token `Vec` is sorted (`BTreeSet`-derived), never hash-iterated; the
-/// `markets` preserve each resolution's deterministic (sorted) order.
-fn merge_token_ids(
-    resolutions: &[Resolution],
-    raw_asset_ids: &[String],
-) -> (ResolvedSubscription, usize) {
-    let mut set: BTreeSet<String> = BTreeSet::new();
-    let mut markets: Vec<MarketMeta> = Vec::new();
-    let mut seen_markets: BTreeSet<String> = BTreeSet::new();
-    let mut skipped_closed = 0usize;
-    for r in resolutions {
-        skipped_closed += r.skipped_closed;
-        for id in &r.token_ids {
-            set.insert(id.to_string());
-        }
-        // Dedup metadata too: a market requested via both --event and --market
-        // resolves twice. Keyed on the yes-token id (which is unique per market),
-        // keep the first occurrence — preserving each resolution's sorted order —
-        // so we never record the same PolyEvent::Market twice.
-        for m in &r.markets {
-            if seen_markets.insert(m.yes_asset_id.to_string()) {
-                markets.push(m.clone());
-            }
-        }
-    }
-    for id in raw_asset_ids {
-        set.insert(id.clone());
-    }
-    (
-        ResolvedSubscription {
-            token_ids: set.into_iter().collect(),
-            markets,
-        },
-        skipped_closed,
-    )
-}
-
 /// Resolve `--event` / `--market` references (via the Gamma API at `base`) and
 /// merge with raw `--asset-id`s into a sorted, deduplicated token-id list.
 ///
-/// Errors if no references of any kind are given (clap can't express
-/// "at-least-one-of" across the three flags). Logs how many markets were skipped
-/// as closed and the final token count — no silent caps.
+/// Thin wrapper over [`otelma_polymarket::resolve_subscription`] (which owns the
+/// merge/dedup and the at-least-one-selector / zero-token policy checks); this
+/// adds the CLI's `anyhow` context.
 pub async fn resolve_asset_ids(
     base: &str,
     events: &[String],
@@ -90,37 +30,9 @@ pub async fn resolve_asset_ids(
     raw_asset_ids: &[String],
     include_closed: bool,
 ) -> Result<ResolvedSubscription> {
-    if events.is_empty() && markets.is_empty() && raw_asset_ids.is_empty() {
-        bail!("nothing to record: pass at least one of --event, --market, or --asset-id");
-    }
-
-    let mut resolutions = Vec::new();
-    for ev in events {
-        let r = resolve_event(base, ev, include_closed)
-            .await
-            .with_context(|| format!("resolving event {ev:?}"))?;
-        tracing::info!(event = %ev, tokens = r.token_ids.len(), markets = r.markets.len(), skipped_closed = r.skipped_closed, "resolved event");
-        resolutions.push(r);
-    }
-    for mk in markets {
-        let r = resolve_market(base, mk, include_closed)
-            .await
-            .with_context(|| format!("resolving market {mk:?}"))?;
-        tracing::info!(market = %mk, tokens = r.token_ids.len(), markets = r.markets.len(), skipped_closed = r.skipped_closed, "resolved market");
-        resolutions.push(r);
-    }
-
-    let (sub, skipped_closed) = merge_token_ids(&resolutions, raw_asset_ids);
-    if sub.token_ids.is_empty() {
-        bail!("resolved zero token ids — every matched market was closed or had malformed tokens (try --include-closed for closed ones)");
-    }
-    tracing::info!(
-        tokens = sub.token_ids.len(),
-        markets = sub.markets.len(),
-        skipped_closed,
-        "resolved subscription set"
-    );
-    Ok(sub)
+    resolve_subscription(base, events, markets, raw_asset_ids, include_closed)
+        .await
+        .context("resolving subscription")
 }
 
 /// Live-capture Polymarket for `asset_ids` into `out_dir` until Ctrl+C.
@@ -256,89 +168,14 @@ mod tests {
         )
     }
 
-    fn res(ids: &[&str], skipped: usize) -> Resolution {
-        Resolution {
-            token_ids: ids.iter().map(|s| (*s).into()).collect(),
-            markets: Vec::new(),
-            skipped_closed: skipped,
-        }
-    }
-
-    fn res_with_markets(ids: &[&str], markets: Vec<MarketMeta>, skipped: usize) -> Resolution {
-        Resolution {
-            token_ids: ids.iter().map(|s| (*s).into()).collect(),
-            markets,
-            skipped_closed: skipped,
-        }
-    }
-
-    #[test]
-    fn merge_dedups_and_sorts_across_sources() {
-        let resolutions = vec![res(&["500", "100"], 1), res(&["300", "100"], 2)];
-        let raw = vec!["100".to_string(), "999".to_string()];
-        let (sub, skipped) = merge_token_ids(&resolutions, &raw);
-        assert_eq!(sub.token_ids, vec!["100", "300", "500", "999"]);
-        assert!(sub.markets.is_empty());
-        assert_eq!(skipped, 3);
-    }
-
-    #[test]
-    fn merge_with_only_raw_asset_ids() {
-        let (sub, skipped) = merge_token_ids(&[], &["b".to_string(), "a".to_string()]);
-        assert_eq!(sub.token_ids, vec!["a", "b"]);
-        // Raw asset ids carry no metadata.
-        assert!(sub.markets.is_empty());
-        assert_eq!(skipped, 0);
-    }
-
-    #[test]
-    fn merge_collects_market_metadata_across_resolutions() {
-        use otelma_polymarket::testing::market_meta;
-        let resolutions = vec![
-            res_with_markets(
-                &["500", "100"],
-                vec![market_meta("Argentina", "500", "100", Some("World Cup"))],
-                0,
-            ),
-            res_with_markets(
-                &["300", "200"],
-                vec![market_meta("Brazil", "300", "200", Some("World Cup"))],
-                0,
-            ),
-        ];
-        let (sub, _) = merge_token_ids(&resolutions, &["raw".to_string()]);
-        assert_eq!(sub.token_ids, vec!["100", "200", "300", "500", "raw"]);
-        assert_eq!(
-            sub.markets
-                .iter()
-                .map(|m| m.outcome_title.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Argentina", "Brazil"]
-        );
-    }
-
-    #[test]
-    fn merge_dedups_market_metadata_across_resolutions() {
-        use otelma_polymarket::testing::market_meta;
-        // The same market resolved twice (e.g. via both --event and --market):
-        // same yes-token id → its metadata is recorded exactly once.
-        let arg = market_meta("Argentina", "500", "100", Some("World Cup"));
-        let resolutions = vec![
-            res_with_markets(&["500", "100"], vec![arg.clone()], 0),
-            res_with_markets(&["500", "100"], vec![arg.clone()], 0),
-        ];
-        let (sub, _) = merge_token_ids(&resolutions, &[]);
-        assert_eq!(sub.token_ids, vec!["100", "500"]);
-        assert_eq!(sub.markets.len(), 1, "duplicate market metadata deduped");
-        assert_eq!(sub.markets[0].outcome_title, "Argentina");
-    }
-
     #[tokio::test]
     async fn resolve_asset_ids_errors_when_nothing_given() {
         let err = resolve_asset_ids("http://unused", &[], &[], &[], false)
             .await
             .expect_err("should require at least one ref");
-        assert!(err.to_string().contains("at least one"));
+        // The "at least one" policy now lives in the shared resolver; the CLI
+        // wraps it with anyhow context, so check the full error chain.
+        assert!(format!("{err:#}").contains("at least one"));
     }
 
     #[tokio::test]

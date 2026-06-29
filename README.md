@@ -79,7 +79,29 @@ replayer against a real session directory:
 cargo run -p otelma-replay-egui <SESSION_DIR>
 ```
 
-The replayer only ever replays recorded data — it never fabricates a session.
+The same binary can also run as a **live recorder + monitor**: pass `--live`
+with any mix of `--event` / `--market` / `--asset-id` (all repeatable) and it
+runs the Polymarket client itself, teeing every message to a `Recorder` (rolled
+Parquet on disk, like `otelma record`) and the on-screen plots — so you watch the
+market live while it's being captured:
+
+```bash
+# Live-capture an event to recordings/<UTC timestamp>/ while monitoring it.
+cargo run -p otelma-replay-egui -- --live --event <slug|url>
+# Other selectors (combinable), closed markets, and a custom out dir:
+cargo run -p otelma-replay-egui -- --live --market <slug|url> --asset-id <TOKEN> \
+    --include-closed --out my-session/
+```
+
+In live mode the speed slider, pause/restart, and timeline scrubber are hidden
+(the stream is already real-time); a `● LIVE` status line shows the output dir,
+event count, and current seq. Either way the replayer never fabricates data — it
+replays a recorded session or captures a real live stream.
+
+> Known limitation: in `--live` mode the on-screen series grow unbounded (one
+> point per message) and the view clones its state each frame, so a very
+> long-running live monitor uses ever more memory. The on-disk recording is
+> unaffected — stop and replay it, or restart the monitor, for long captures.
 
 ## How it works
 
@@ -134,7 +156,7 @@ columns; the payload is an opaque MessagePack blob. The reader reconstructs
 | `otelma` | The core engine: `Message<T>`, `Recorder`, `SessionReader`, `drive`/`drive_realtime`, `Sink`. Generic, venue-agnostic. |
 | `otelma-polymarket` | Batteries-included Polymarket integration: `PolyEvent` payload (book/trade/price-change, plus adapter-emitted `Connection` and `Market` metadata), a pure WS frame parser, a Gamma REST resolver, and a reconnecting WebSocket client. |
 | `otelma-cli` | The `otelma` binary: `record` / `replay` / `compact`. |
-| `otelma-replay-egui` | A desktop replayer (eframe + egui_plot) with live plots and a timeline scrubber; replays a real recorded session. Non-default workspace member, so the core build stays lean. |
+| `otelma-replay-egui` | A desktop replayer (eframe + egui_plot) with live plots and a timeline scrubber; replays a real recorded session, or with `--live` runs as a live recorder + monitor (capturing to disk while plotting). Non-default workspace member, so the core build stays lean. |
 
 ## Adding your own payload
 

@@ -3205,6 +3205,7 @@ name = "otelma-replay-egui"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "clap",
  "eframe",
  "egui",
  "egui_plot",
@@ -3212,6 +3213,11 @@ dependencies = [
  "otelma-polymarket",
  "rust_decimal",
  "rust_decimal_macros",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

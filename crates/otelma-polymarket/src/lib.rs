@@ -11,6 +11,7 @@ mod client;
 mod event;
 mod gamma;
 mod parser;
+mod subscription;
 mod types;
 
 #[cfg(any(test, feature = "testing"))]
@@ -23,4 +24,5 @@ pub use gamma::{
     resolve_event, resolve_market, GammaError, Resolution, DEFAULT_GAMMA_BASE,
 };
 pub use parser::{parse_ws_frame, ParseError};
+pub use subscription::{resolve_subscription, ResolvedSubscription};
 pub use types::{AssetId, MarketId, Price, Size};

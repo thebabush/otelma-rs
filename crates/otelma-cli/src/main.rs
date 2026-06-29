@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
                 include_closed,
             )
             .await?;
-            let out_dir = out.unwrap_or_else(|| commands::default_session_dir(chrono::Utc::now()));
+            let out_dir = out.unwrap_or_else(|| otelma::default_session_dir(chrono::Utc::now()));
             let count = commands::run_record(sub.token_ids, sub.markets, out_dir.clone()).await?;
             println!("recorded {count} messages → {}", out_dir.display());
         }

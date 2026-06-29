@@ -49,6 +49,13 @@ pub struct AssetState {
 }
 
 /// All state shared between the feeder thread and the GUI.
+///
+/// KNOWN LIMITATION: the per-asset series (`book_series`/`trades`) grow without
+/// bound — one point per message — and the GUI clones the whole `ReplayState`
+/// each frame. That is fine for a bounded replay, but in `--live` mode a
+/// long-running capture accumulates memory indefinitely and the per-frame clone
+/// gets progressively costlier. The on-disk recording is unaffected. A future fix
+/// is to ring-buffer the *displayed* history (the full data stays on disk).
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ReplayState {
     /// Per-asset accumulated series, keyed by asset id (sorted).

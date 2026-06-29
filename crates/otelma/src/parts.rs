@@ -53,6 +53,15 @@ pub(crate) fn part_file_name(start: DateTime<Utc>) -> String {
     format!("{}.parquet", start.format("%Y%m%dT%H%M%SZ"))
 }
 
+/// The default session directory for a new recording: `recordings/<UTC start>/`
+/// in the same basic-ISO form as the part files. The engine takes any
+/// `session_dir`; this is just the convention recording front-ends (the CLI's
+/// `record` and the egui `--live` mode) share when no explicit `--out` is given,
+/// so it lives in one place rather than being copied per front-end.
+pub fn default_session_dir(start: DateTime<Utc>) -> PathBuf {
+    PathBuf::from("recordings").join(start.format("%Y%m%dT%H%M%SZ").to_string())
+}
+
 /// Discover the part files in `session_dir`, in chronological order (the
 /// basic-ISO UTC names are fixed-width, so a lexical sort *is* chronological).
 /// Only files matching the part naming convention (see [`part_file_name`]) are

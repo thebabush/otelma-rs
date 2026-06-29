@@ -11,6 +11,7 @@ use egui_plot::{Line, MarkerShape, Plot, Points};
 use otelma_polymarket::AssetId;
 
 use crate::feeder::Feeder;
+use crate::live::LiveFeeder;
 use crate::state::ReplayState;
 
 /// As-fast-as-possible speed.
@@ -19,78 +20,144 @@ const FAST_SPEED: f64 = f64::INFINITY;
 const SPEED_MIN: f64 = 0.5;
 const SPEED_MAX: f64 = 1000.0;
 
+/// The data source the app renders: a paced replay (with playback controls) or
+/// a live capture (no pacing — the controls are meaningless and hidden).
+enum Source {
+    /// Replay a recorded session from disk, paced by a [`Feeder`].
+    Replay {
+        feeder: Feeder,
+        /// Last finite speed chosen on the slider (restored when leaving "fast").
+        last_finite_speed: f64,
+        fast: bool,
+    },
+    /// Live-capture the venue while recording to disk, via a [`LiveFeeder`].
+    Live { feeder: LiveFeeder },
+}
+
+impl Source {
+    /// Snapshot the shared state under a short lock, whatever the mode.
+    fn snapshot(&self) -> ReplayState {
+        let state = match self {
+            Source::Replay { feeder, .. } => &feeder.state,
+            Source::Live { feeder } => &feeder.state,
+        };
+        state.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// Stop and join the underlying feeder thread (on window close).
+    fn stop_and_join(&mut self) {
+        match self {
+            Source::Replay { feeder, .. } => feeder.stop_and_join(),
+            Source::Live { feeder } => feeder.stop_and_join(),
+        }
+    }
+}
+
 /// The replayer application.
 pub struct ReplayApp {
-    feeder: Feeder,
+    source: Source,
     selected_asset: Option<AssetId>,
-    /// Last finite speed chosen on the slider (restored when leaving "fast").
-    last_finite_speed: f64,
-    fast: bool,
 }
 
 impl ReplayApp {
-    /// Build the app over a started [`Feeder`].
+    /// Build the app over a started replay [`Feeder`].
     pub fn new(feeder: Feeder) -> Self {
         let speed = feeder.control.speed();
         let fast = !speed.is_finite();
         Self {
-            feeder,
+            source: Source::Replay {
+                last_finite_speed: if fast { 1.0 } else { speed },
+                fast,
+                feeder,
+            },
             selected_asset: None,
-            last_finite_speed: if fast { 1.0 } else { speed },
-            fast,
+        }
+    }
+
+    /// Build the app over a started [`LiveFeeder`] (live capture + monitor).
+    pub fn new_live(feeder: LiveFeeder) -> Self {
+        Self {
+            source: Source::Live { feeder },
+            selected_asset: None,
         }
     }
 
     /// Snapshot the shared state under a short lock.
     fn snapshot(&self) -> ReplayState {
-        self.feeder
-            .state
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_default()
+        self.source.snapshot()
     }
 
     fn controls_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
-        ui.horizontal(|ui| {
-            let paused = self.feeder.control.is_paused();
-            if ui
-                .button(if paused { "▶ Play" } else { "⏸ Pause" })
-                .clicked()
-            {
-                if paused {
-                    self.feeder.control.resume();
-                } else {
-                    self.feeder.control.pause();
-                }
-            }
-            if ui.button("⟲ Restart").clicked() {
-                self.feeder.restart();
-                self.selected_asset = None;
-            }
+        // `restart` re-opens the reader; clear the selection afterwards. Tracked
+        // here so the closure can borrow `self.source` mutably without also
+        // touching `self.selected_asset`.
+        let mut restarted = false;
+        match &mut self.source {
+            Source::Replay {
+                feeder,
+                last_finite_speed,
+                fast,
+            } => {
+                ui.horizontal(|ui| {
+                    let paused = feeder.control.is_paused();
+                    if ui
+                        .button(if paused { "▶ Play" } else { "⏸ Pause" })
+                        .clicked()
+                    {
+                        if paused {
+                            feeder.control.resume();
+                        } else {
+                            feeder.control.pause();
+                        }
+                    }
+                    if ui.button("⟲ Restart").clicked() {
+                        feeder.restart();
+                        restarted = true;
+                    }
 
-            ui.separator();
+                    ui.separator();
 
-            let mut fast = self.fast;
-            if ui.checkbox(&mut fast, "As fast as possible").changed() {
-                self.fast = fast;
-                if fast {
-                    self.feeder.control.set_speed(FAST_SPEED);
-                } else {
-                    self.feeder.control.set_speed(self.last_finite_speed);
-                }
+                    let mut want_fast = *fast;
+                    if ui.checkbox(&mut want_fast, "As fast as possible").changed() {
+                        *fast = want_fast;
+                        if want_fast {
+                            feeder.control.set_speed(FAST_SPEED);
+                        } else {
+                            feeder.control.set_speed(*last_finite_speed);
+                        }
+                    }
+
+                    ui.add_enabled_ui(!*fast, |ui| {
+                        let mut speed = *last_finite_speed;
+                        let slider = egui::Slider::new(&mut speed, SPEED_MIN..=SPEED_MAX)
+                            .logarithmic(true)
+                            .text("speed ×");
+                        if ui.add(slider).changed() {
+                            *last_finite_speed = speed;
+                            feeder.control.set_speed(speed);
+                        }
+                    });
+                });
             }
-
-            ui.add_enabled_ui(!self.fast, |ui| {
-                let mut speed = self.last_finite_speed;
-                let slider = egui::Slider::new(&mut speed, SPEED_MIN..=SPEED_MAX)
-                    .logarithmic(true)
-                    .text("speed ×");
-                if ui.add(slider).changed() {
-                    self.last_finite_speed = speed;
-                    self.feeder.control.set_speed(speed);
-                }
-            });
-        });
+            Source::Live { feeder } => {
+                // Live: no pacing/scrubbing/restart — show a recording status line.
+                let seq = state
+                    .current_seq
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!(
+                        "● LIVE — recording to {} · {} events · seq {seq}",
+                        feeder.out_dir.display(),
+                        state.message_count,
+                    ),
+                );
+            }
+        }
+        if restarted {
+            self.selected_asset = None;
+        }
 
         ui.horizontal(|ui| {
             let sim_t = match (state.start_ts, state.current_ts) {
@@ -211,8 +278,12 @@ impl eframe::App for ReplayApp {
         let ctx = ui.ctx().clone();
         let state = self.snapshot();
 
+        let heading = match self.source {
+            Source::Replay { .. } => "otelma replayer",
+            Source::Live { .. } => "otelma live monitor",
+        };
         egui::Panel::top("controls").show(ui, |ui| {
-            ui.heading("otelma replayer");
+            ui.heading(heading);
             self.controls_ui(ui, &state);
             self.asset_selector_ui(ui, &state);
         });
@@ -230,6 +301,6 @@ impl eframe::App for ReplayApp {
     }
 
     fn on_exit(&mut self) {
-        self.feeder.stop_and_join();
+        self.source.stop_and_join();
     }
 }
