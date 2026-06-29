@@ -9,6 +9,7 @@
 //! `Message.timestamp`. Payloads are serialized as opaque MessagePack blobs via
 //! [`encode_payload`] / [`decode_payload`].
 
+mod clock;
 mod codec;
 mod error;
 mod message;
@@ -21,6 +22,7 @@ mod replay;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use clock::{classify_backstep, Backstep};
 pub use codec::{decode_payload, encode_payload};
 pub use error::Error;
 pub use message::{Message, Payload};

@@ -15,19 +15,23 @@
 //! whole run (reconnects included) and timestamps are non-decreasing — a
 //! backwards clock (NTP step-back) is clamped to the last stamp. Recordings
 //! this client produces therefore always pass the reader's monotonicity guard.
+//! A small backstep is clamped silently and a larger one with a warning, but a
+//! backstep beyond the fatal tolerance aborts capture outright (the recorded
+//! timeline can no longer be trusted) — the one capture-boundary failure that is
+//! deliberately *not* resilient.
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures_util::{SinkExt, StreamExt};
-use otelma::Message;
+use otelma::{classify_backstep, Backstep, Message};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
 
-use crate::event::PolyEvent;
+use crate::event::{MarketMeta, PolyEvent};
 use crate::parser::parse_ws_frame;
 
 /// Default Polymarket CLOB market WebSocket URL.
@@ -39,6 +43,13 @@ const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// Reconnect backoff bounds.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Backward wall-clock jumps larger than this are surfaced with a warning;
+/// smaller ones are treated as ordinary jitter and clamped silently.
+const CLOCK_BACKSTEP_WARN_SECS: i64 = 1;
+/// Backward wall-clock jumps larger than this abort capture: the clock moved so
+/// far back that the recorded timeline can no longer be trusted.
+const CLOCK_BACKSTEP_FATAL_SECS: i64 = 60;
 
 /// Errors from the WS client.
 #[derive(Debug, Error)]
@@ -54,6 +65,15 @@ pub enum Error {
     /// Failed to serialize the subscribe message.
     #[error("subscribe encode error: {0}")]
     Subscribe(#[from] serde_json::Error),
+
+    /// The wall clock stepped backward by more than capture can tolerate; the
+    /// recorded timeline can no longer be trusted, so capture is aborted. Unlike
+    /// a transport error, this does not trigger a reconnect.
+    #[error("wall clock stepped backward by {by} beyond tolerance; aborting capture")]
+    ClockBackstep {
+        /// How far the clock moved backward.
+        by: TimeDelta,
+    },
 }
 
 /// The market-subscription message sent on connect.
@@ -79,7 +99,8 @@ pub fn subscribe_message(asset_ids: &[String]) -> Result<String, serde_json::Err
 /// without a socket.
 ///
 /// Guarantees: `seq` strictly increases; timestamps never decrease (a backwards
-/// clock is clamped to the previous timestamp).
+/// clock is clamped to the previous timestamp). A backwards step beyond the
+/// fatal tolerance is refused outright (see [`Stamper::stamp`]).
 pub struct Stamper<C> {
     clock: C,
     seq: u64,
@@ -98,8 +119,37 @@ impl<C: Fn() -> DateTime<Utc>> Stamper<C> {
 
     /// Wrap `payload` in a stamped [`Message`], advancing seq and the clamped
     /// timestamp.
-    pub fn stamp(&mut self, payload: PolyEvent) -> Message<PolyEvent> {
+    ///
+    /// A wall clock that steps backward is clamped forward to the previous
+    /// instant so the timeline stays non-decreasing. A small backstep (jitter)
+    /// is silent; a larger one is warned about; a backstep beyond
+    /// [`CLOCK_BACKSTEP_FATAL_SECS`] returns [`Error::ClockBackstep`] without
+    /// advancing seq or the timeline — the clock is wrong enough that the
+    /// capture can no longer be trusted.
+    pub fn stamp(&mut self, payload: PolyEvent) -> Result<Message<PolyEvent>, Error> {
         let raw = (self.clock)();
+        match classify_backstep(
+            self.last_ts,
+            raw,
+            TimeDelta::seconds(CLOCK_BACKSTEP_WARN_SECS),
+            TimeDelta::seconds(CLOCK_BACKSTEP_FATAL_SECS),
+        ) {
+            Backstep::None | Backstep::Tolerated { .. } => {}
+            Backstep::Notable { by } => {
+                tracing::warn!(
+                    backstep_ms = by.num_milliseconds(),
+                    "wall clock stepped backward; clamping and continuing"
+                );
+            }
+            Backstep::Excessive { by } => {
+                tracing::error!(
+                    backstep_ms = by.num_milliseconds(),
+                    "wall clock stepped backward beyond tolerance; aborting capture"
+                );
+                return Err(Error::ClockBackstep { by });
+            }
+        }
+
         let ts = match self.last_ts {
             Some(prev) if raw < prev => prev,
             _ => raw,
@@ -107,7 +157,7 @@ impl<C: Fn() -> DateTime<Utc>> Stamper<C> {
         let seq = self.seq;
         self.seq += 1;
         self.last_ts = Some(ts);
-        Message::new(seq, ts, payload)
+        Ok(Message::new(seq, ts, payload))
     }
 }
 
@@ -115,6 +165,7 @@ impl<C: Fn() -> DateTime<Utc>> Stamper<C> {
 pub struct PolymarketClient<C = fn() -> DateTime<Utc>> {
     url: String,
     asset_ids: Vec<String>,
+    markets: Vec<MarketMeta>,
     clock: C,
 }
 
@@ -130,6 +181,7 @@ impl PolymarketClient {
         Self {
             url,
             asset_ids,
+            markets: Vec::new(),
             clock: Utc::now,
         }
     }
@@ -141,8 +193,16 @@ impl<C: Fn() -> DateTime<Utc>> PolymarketClient<C> {
         PolymarketClient {
             url: self.url,
             asset_ids: self.asset_ids,
+            markets: self.markets,
             clock,
         }
+    }
+
+    /// Attach market metadata to be emitted (as [`PolyEvent::Market`]) as the
+    /// very first messages of the recording, before any connection is made.
+    pub fn with_markets(mut self, markets: Vec<MarketMeta>) -> Self {
+        self.markets = markets;
+        self
     }
 
     /// Run the client: connect, subscribe, emit stamped messages, reconnect on
@@ -159,9 +219,15 @@ impl<C: Fn() -> DateTime<Utc>> PolymarketClient<C> {
         let PolymarketClient {
             url,
             asset_ids,
+            markets,
             clock,
         } = self;
         let mut stamper = Stamper::new(clock);
+
+        // Emit market metadata first so a recording is self-contained: these get
+        // seq 0..N-1, before any connection marker or venue data.
+        emit_market_metadata(&mut stamper, &markets, &tx).await?;
+
         let mut backoff = BACKOFF_MIN;
 
         loop {
@@ -193,6 +259,12 @@ impl<C: Fn() -> DateTime<Utc>> PolymarketClient<C> {
                     }
                 }
                 Err(e) => {
+                    // A backwards-clock abort is terminal — the recorded timeline
+                    // is untrustworthy, so stop rather than reconnect. Every other
+                    // session error is operational: back off and retry.
+                    if matches!(e, Error::ClockBackstep { .. }) {
+                        return Err(e);
+                    }
                     tracing::warn!(error = %e, "polymarket ws session error; reconnecting");
                 }
             }
@@ -201,15 +273,11 @@ impl<C: Fn() -> DateTime<Utc>> PolymarketClient<C> {
             // connected state — a failed initial connect (or a retry during a
             // prolonged outage) never emitted `Connection{true}`, so emitting a
             // `false` would be misleading noise.
-            if was_connected
-                && emit(
-                    &tx,
-                    stamper.stamp(PolyEvent::Connection { connected: false }),
-                )
-                .await
-                .is_err()
-            {
-                return Err(Error::ChannelClosed);
+            if was_connected {
+                let marker = stamper.stamp(PolyEvent::Connection { connected: false })?;
+                if emit(&tx, marker).await.is_err() {
+                    return Err(Error::ChannelClosed);
+                }
             }
 
             tokio::select! {
@@ -238,10 +306,8 @@ async fn run_session<C: Fn() -> DateTime<Utc>>(
     // Subscribe, then announce connectivity.
     ws.send(WsMessage::text(subscribe_message(asset_ids)?))
         .await?;
-    if emit(tx, stamper.stamp(PolyEvent::Connection { connected: true }))
-        .await
-        .is_err()
-    {
+    let connect_marker = stamper.stamp(PolyEvent::Connection { connected: true })?;
+    if emit(tx, connect_marker).await.is_err() {
         return Ok(SessionEnd::ChannelClosed);
     }
     *was_connected = true;
@@ -310,7 +376,8 @@ async fn handle_frame<C: Fn() -> DateTime<Utc>>(
         // PriceChange — never a synthetic Connection), so reaching here means
         // the session delivered data and is "stable".
         *saw_data = true;
-        if emit(tx, stamper.stamp(event)).await.is_err() {
+        let msg = stamper.stamp(event)?;
+        if emit(tx, msg).await.is_err() {
             return Ok(false);
         }
     }
@@ -344,6 +411,25 @@ enum SessionEnd {
     ChannelClosed,
 }
 
+/// Emit one [`PolyEvent::Market`] per market via `stamper`, in order, before any
+/// other message. These become the recording's first messages (seq 0..N-1).
+///
+/// `stamp` is fallible (a `ClockBackstep`), so it is propagated with `?`; at
+/// startup the stamper's `last_ts` is `None`, so no backstep can occur here.
+async fn emit_market_metadata<C: Fn() -> DateTime<Utc>>(
+    stamper: &mut Stamper<C>,
+    markets: &[MarketMeta],
+    tx: &mpsc::Sender<Message<PolyEvent>>,
+) -> Result<(), Error> {
+    for meta in markets {
+        let msg = stamper.stamp(PolyEvent::Market(meta.clone()))?;
+        if emit(tx, msg).await.is_err() {
+            return Err(Error::ChannelClosed);
+        }
+    }
+    Ok(())
+}
+
 /// Send a message, mapping a closed channel to a unit error.
 async fn emit(tx: &mpsc::Sender<Message<PolyEvent>>, msg: Message<PolyEvent>) -> Result<(), ()> {
     tx.send(msg).await.map_err(|_| ())
@@ -368,9 +454,15 @@ mod tests {
     #[test]
     fn stamper_seq_strictly_increases() {
         let mut stamper = Stamper::new(|| dt(100));
-        let a = stamper.stamp(PolyEvent::Connection { connected: true });
-        let b = stamper.stamp(PolyEvent::Connection { connected: false });
-        let c = stamper.stamp(PolyEvent::Connection { connected: true });
+        let a = stamper
+            .stamp(PolyEvent::Connection { connected: true })
+            .expect("a");
+        let b = stamper
+            .stamp(PolyEvent::Connection { connected: false })
+            .expect("b");
+        let c = stamper
+            .stamp(PolyEvent::Connection { connected: true })
+            .expect("c");
         assert_eq!((a.seq, b.seq, c.seq), (0, 1, 2));
     }
 
@@ -381,12 +473,19 @@ mod tests {
         let clock = || times.lock().expect("lock").next().expect("time");
         let mut stamper = Stamper::new(clock);
 
-        let a = stamper.stamp(PolyEvent::Connection { connected: true });
-        let b = stamper.stamp(PolyEvent::Connection { connected: false });
-        let c = stamper.stamp(PolyEvent::Connection { connected: true });
+        let a = stamper
+            .stamp(PolyEvent::Connection { connected: true })
+            .expect("a");
+        let b = stamper
+            .stamp(PolyEvent::Connection { connected: false })
+            .expect("b");
+        let c = stamper
+            .stamp(PolyEvent::Connection { connected: true })
+            .expect("c");
 
         assert_eq!(a.timestamp, dt(100));
-        // 50 < 100 → clamped to 100 (non-decreasing).
+        // 50 < 100, a 50s backstep → within the fatal bound, so it warns and
+        // clamps to 100 (non-decreasing) rather than aborting.
         assert_eq!(b.timestamp, dt(100));
         // 200 > 100 → accepted.
         assert_eq!(c.timestamp, dt(200));
@@ -395,10 +494,42 @@ mod tests {
     }
 
     #[test]
+    fn stamper_aborts_on_excessive_backstep() {
+        // First sample, then a clock that jumps back well beyond the fatal bound,
+        // then a recovered forward sample.
+        let times = std::sync::Mutex::new(vec![dt(10_000), dt(9_400), dt(10_001)].into_iter());
+        let clock = || times.lock().expect("lock").next().expect("time");
+        let mut stamper = Stamper::new(clock);
+
+        let first = stamper
+            .stamp(PolyEvent::Connection { connected: true })
+            .expect("first ok");
+        assert_eq!((first.seq, first.timestamp), (0, dt(10_000)));
+
+        // A 600s backstep exceeds the fatal bound → error, and the failed stamp
+        // must not consume a seq or advance the timeline.
+        let err = stamper
+            .stamp(PolyEvent::Connection { connected: false })
+            .expect_err("excessive backstep must abort");
+        assert!(matches!(err, Error::ClockBackstep { .. }));
+
+        // The next valid sample is therefore still seq 1, clamped against the
+        // last *accepted* instant (10_000), not the rejected one.
+        let next = stamper
+            .stamp(PolyEvent::Connection { connected: true })
+            .expect("recovered ok");
+        assert_eq!((next.seq, next.timestamp), (1, dt(10_001)));
+    }
+
+    #[test]
     fn stamper_fixed_clock_is_non_decreasing() {
         let mut stamper = Stamper::new(|| dt(42));
         let msgs: Vec<_> = (0..5)
-            .map(|_| stamper.stamp(PolyEvent::Connection { connected: true }))
+            .map(|_| {
+                stamper
+                    .stamp(PolyEvent::Connection { connected: true })
+                    .expect("stamp")
+            })
             .collect();
         for w in msgs.windows(2) {
             assert!(w[1].seq > w[0].seq);
@@ -416,8 +547,56 @@ mod tests {
             market: None,
             exchange_ts_millis: None,
         });
-        let msg = stamper.stamp(book.clone());
+        let msg = stamper.stamp(book.clone()).expect("stamp");
         assert_eq!(msg.payload, book);
+    }
+
+    #[tokio::test]
+    async fn emit_market_metadata_emits_markets_in_order_with_seq_from_zero() {
+        use crate::testing::market_meta;
+
+        let markets = vec![
+            market_meta("Argentina", "y-arg", "n-arg", Some("World Cup")),
+            market_meta("Brazil", "y-bra", "n-bra", Some("World Cup")),
+        ];
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut stamper = Stamper::new(|| dt(1));
+
+        emit_market_metadata(&mut stamper, &markets, &tx)
+            .await
+            .expect("emit ok");
+
+        // Exactly the markets, in order, as PolyEvent::Market, seq 0..N-1.
+        let first = rx.try_recv().expect("first");
+        let second = rx.try_recv().expect("second");
+        assert!(rx.try_recv().is_err(), "only the two markets are emitted");
+
+        assert_eq!(first.seq, 0);
+        assert_eq!(second.seq, 1);
+        let PolyEvent::Market(m0) = &first.payload else {
+            panic!("expected Market, got {:?}", first.payload);
+        };
+        let PolyEvent::Market(m1) = &second.payload else {
+            panic!("expected Market, got {:?}", second.payload);
+        };
+        assert_eq!(m0.outcome_title, "Argentina");
+        assert_eq!(m1.outcome_title, "Brazil");
+
+        // The stamper's seq counter is left at 2, so subsequent events follow.
+        let next = stamper
+            .stamp(PolyEvent::Connection { connected: true })
+            .expect("next");
+        assert_eq!(next.seq, 2);
+    }
+
+    #[tokio::test]
+    async fn emit_market_metadata_empty_is_noop() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut stamper = Stamper::new(|| dt(1));
+        emit_market_metadata(&mut stamper, &[], &tx)
+            .await
+            .expect("emit ok");
+        assert!(rx.try_recv().is_err(), "nothing emitted for empty markets");
     }
 
     #[tokio::test]

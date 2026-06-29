@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use otelma::{Message, Sink};
-use otelma_polymarket::{AssetId, BookUpdate, PolyEvent, Side};
+use otelma_polymarket::{AssetId, BookUpdate, MarketMeta, PolyEvent, Side};
 
 /// One sample of an asset's top-of-book over time (plot point).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,6 +53,9 @@ pub struct AssetState {
 pub struct ReplayState {
     /// Per-asset accumulated series, keyed by asset id (sorted).
     pub assets: BTreeMap<AssetId, AssetState>,
+    /// Human-readable label per asset id, from `Market` metadata messages. A
+    /// `BTreeMap` (never a `HashMap`) keeps iteration deterministic.
+    pub labels: BTreeMap<AssetId, String>,
     /// Most recent `seq` applied.
     pub current_seq: Option<u64>,
     /// Most recent timestamp applied.
@@ -67,6 +70,15 @@ impl ReplayState {
     /// Asset ids seen so far, in sorted order.
     pub fn asset_ids(&self) -> Vec<AssetId> {
         self.assets.keys().cloned().collect()
+    }
+
+    /// Human-readable label for `asset`, falling back to the raw token id when no
+    /// `Market` metadata named it.
+    pub fn label_for(&self, asset: &AssetId) -> String {
+        self.labels
+            .get(asset)
+            .cloned()
+            .unwrap_or_else(|| asset.to_string())
     }
 
     /// Reset to empty (used on restart).
@@ -172,7 +184,24 @@ impl Sink<PolyEvent> for GuiSink<'_> {
             // top-of-book series via PolyEvent::Book.)
             PolyEvent::PriceChange(_) => {}
             PolyEvent::Connection { .. } => {}
+            PolyEvent::Market(meta) => {
+                self.state
+                    .labels
+                    .insert(meta.yes_asset_id.clone(), asset_label(meta, "Yes"));
+                self.state
+                    .labels
+                    .insert(meta.no_asset_id.clone(), asset_label(meta, "No"));
+            }
         }
+    }
+}
+
+/// Human-readable label for one outcome side of a market, e.g.
+/// "Argentina · Yes" (event title prefixed when present).
+fn asset_label(meta: &MarketMeta, side: &str) -> String {
+    match &meta.event_title {
+        Some(event) => format!("{event} · {} · {side}", meta.outcome_title),
+        None => format!("{} · {side}", meta.outcome_title),
     }
 }
 
@@ -249,6 +278,31 @@ mod tests {
         assert_eq!(a.trades[0].price, 0.55);
         assert_eq!(a.trades[0].t_secs, 30.0);
         assert_eq!(a.trades[0].side, Some(Side::Buy));
+    }
+
+    #[test]
+    fn market_meta_populates_label_map() {
+        use otelma_polymarket::testing::{market_meta, market_meta_msg};
+
+        let mut state = ReplayState::default();
+        {
+            let mut sink = GuiSink::new(&mut state);
+            sink.apply(&market_meta_msg(
+                0,
+                0,
+                market_meta("Argentina", "yes-arg", "no-arg", Some("World Cup")),
+            ));
+        }
+        assert_eq!(
+            state.label_for(&AssetId::from("yes-arg")),
+            "World Cup · Argentina · Yes"
+        );
+        assert_eq!(
+            state.label_for(&AssetId::from("no-arg")),
+            "World Cup · Argentina · No"
+        );
+        // Unknown asset falls back to the raw id.
+        assert_eq!(state.label_for(&AssetId::from("other")), "other");
     }
 
     #[test]

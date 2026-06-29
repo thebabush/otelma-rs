@@ -125,7 +125,10 @@ impl ReplayApp {
             ui.label("asset:");
             for asset in &assets {
                 let selected = self.selected_asset.as_ref() == Some(asset);
-                if ui.selectable_label(selected, asset.as_str()).clicked() {
+                if ui
+                    .selectable_label(selected, state.label_for(asset))
+                    .clicked()
+                {
                     self.selected_asset = Some(asset.clone());
                 }
             }
@@ -139,6 +142,8 @@ impl ReplayApp {
         let Some(a) = state.assets.get(asset) else {
             return;
         };
+
+        ui.label(egui::RichText::new(state.label_for(asset)).strong());
 
         let bid: Vec<[f64; 2]> = a
             .book_series

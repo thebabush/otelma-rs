@@ -28,8 +28,14 @@ cargo build
 Use the CLI (`otelma`) to record, replay, and compact real sessions:
 
 ```bash
-# Live-capture Polymarket order books + trades for one or more asset ids.
-otelma record --asset-id <TOKEN_ID> [--asset-id <TOKEN_ID> ...] [--out <DIR>]
+# Live-capture Polymarket order books + trades. Pick what to record by event
+# slug/URL (every live market in it), market slug/URL (one market's 2 tokens),
+# or raw token ids — mix and match freely; --event/--market are repeatable and
+# resolve to token ids via the Gamma REST API.
+otelma record --event <EVENT_SLUG_OR_URL> [--out <DIR>]
+otelma record --market <MARKET_SLUG_OR_URL>
+otelma record --asset-id <TOKEN_ID> [--asset-id <TOKEN_ID> ...]
+# --include-closed also records closed/eliminated markets (default: live only).
 
 # Replay a session through a summary sink. Headless (fastest) by default;
 # --speed paces it in real time (1.0 = real time, inf = as fast as possible);
@@ -52,9 +58,15 @@ by type:
   Connection   1
   Trade        2
 by asset:
-  tok-A: bid=0.52 ask=0.54 trades=1 last=0.53
-  tok-B: bid=0.30 ask=0.33 trades=1 last=0.31
+  tok-A (World Cup Winner · Argentina · Yes): bid=0.52 ask=0.54 trades=1 last=0.53
+  tok-B (World Cup Winner · Argentina · No): bid=0.30 ask=0.33 trades=1 last=0.31
 ```
+
+When recording resolves an `--event`/`--market`, the adapter embeds each market's
+metadata (question, outcome, the Yes/No token ids, event title) as `Market`
+messages at the start of the recording. Replay reads those to label assets with
+human-readable text — no API call on the replay path, so playback stays
+deterministic and the recording is self-contained.
 
 `record` places no orders and is read-only against the venue; it only subscribes
 to market data.
@@ -77,8 +89,8 @@ The replayer only ever replays recorded data — it never fabricates a session.
        ▼
   Message<T>            seq · timestamp · payload
        │
-       ├──────────────► Recorder ───► recordings/<session>/part-0000.parquet
-       │                (hourly-rolled,            part-0001.parquet
+       ├──────────────► Recorder ───► recordings/<session>/20260628T142311Z.parquet
+       │                (hourly-rolled,            20260628T150000Z.parquet
        │                 ZSTD Parquet)             ...
        │
        ▼
@@ -106,8 +118,9 @@ columns; the payload is an opaque MessagePack blob. The reader reconstructs
 - **Crash-resilient recording.** Parquet parts roll on each UTC hour boundary, so
   a crash loses at most the current hour; the reader transparently chains parts.
 - **Monotonic by construction.** The WS adapter stamps strictly-increasing `seq`
-  and non-decreasing UTC timestamps (the clock is injected; an NTP step-back is
-  clamped), and the reader enforces that invariant on read.
+  and non-decreasing UTC timestamps (the clock is injected; a small NTP step-back
+  is clamped, a large one aborts capture), and the reader enforces that invariant
+  on read.
 - **Type-system-first.** Newtypes and enums make illegal states unrepresentable:
   hour-aligned-by-construction part buckets, `Side`/event enums, parse-don't-
   validate at the venue boundary.
@@ -119,7 +132,7 @@ columns; the payload is an opaque MessagePack blob. The reader reconstructs
 | Crate | What it is |
 |-------|-----------|
 | `otelma` | The core engine: `Message<T>`, `Recorder`, `SessionReader`, `drive`/`drive_realtime`, `Sink`. Generic, venue-agnostic. |
-| `otelma-polymarket` | Batteries-included Polymarket integration: `PolyEvent` payload, a pure WS frame parser, and a reconnecting WebSocket client. |
+| `otelma-polymarket` | Batteries-included Polymarket integration: `PolyEvent` payload (book/trade/price-change, plus adapter-emitted `Connection` and `Market` metadata), a pure WS frame parser, a Gamma REST resolver, and a reconnecting WebSocket client. |
 | `otelma-cli` | The `otelma` binary: `record` / `replay` / `compact`. |
 | `otelma-replay-egui` | A desktop replayer (eframe + egui_plot) with live plots and a timeline scrubber; replays a real recorded session. Non-default workspace member, so the core build stays lean. |
 

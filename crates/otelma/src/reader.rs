@@ -1,9 +1,10 @@
 //! [`SessionReader`] — streaming, multi-part reconstruction of a recorded
 //! `Message<T>` stream.
 //!
-//! A session directory is a set of zero-padded `part-*.parquet` files. The
-//! reader discovers them, orders them lexically (which matches their numeric
-//! order), and iterates rows lazily: it holds one part's
+//! A session directory is a set of UTC-named part files
+//! (`YYYYMMDDTHHMMSSZ.parquet`). The reader discovers them, orders them lexically
+//! (which, with the fixed-width names, is chronological order), and iterates rows
+//! lazily: it holds one part's
 //! [`ParquetRecordBatchReader`] and one decoded batch at a time, so memory is
 //! O(batch), not O(session).
 //!
@@ -273,7 +274,7 @@ mod tests {
     fn monotonicity_violation_across_parts() {
         let dir = tempdir().expect("tempdir");
 
-        // First recorder: hour 10 → part-0000.
+        // First recorder: hour 10 → 20260101T100000Z.parquet.
         record_stream(
             dir.path(),
             &[
@@ -281,11 +282,9 @@ mod tests {
                 Message::new(5, ts("2026-01-01T10:30:00Z"), SampleEvent::Tick),
             ],
         );
-        // Second recorder writes into the same dir, but a fresh Recorder restarts
-        // its part index at 0 — so it would clobber part-0000. Instead, hand the
-        // overlapping-seq part a later name by recording into a sub-session then
-        // moving the file. Simplest: record a second session and copy its single
-        // part in as part-0001.
+        // Record a second session (hour 11, an overlapping seq) and copy its part
+        // into the first dir. Its UTC-derived name (20260101T110000Z) sorts after
+        // the first part, so the reader chains them in order.
         let dir2 = tempdir().expect("tempdir2");
         record_stream(
             dir2.path(),
@@ -294,8 +293,8 @@ mod tests {
                 Message::new(3, ts("2026-01-01T11:00:00Z"), SampleEvent::Tick),
             ],
         );
-        let src = dir2.path().join("part-0000.parquet");
-        let dst = dir.path().join("part-0001.parquet");
+        let src = dir2.path().join("20260101T110000Z.parquet");
+        let dst = dir.path().join("20260101T110000Z.parquet");
         std::fs::copy(&src, &dst).expect("copy part");
 
         let reader = SessionReader::<SampleEvent>::open(dir.path()).expect("open");
@@ -364,7 +363,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         // Rows 0,5 then 3 (violates after 5) then 4. All in one part / hour.
         write_raw_part(
-            &dir.path().join("part-0000.parquet"),
+            &dir.path().join("20260101T100000Z.parquet"),
             &[
                 (0, "2026-01-01T10:00:00Z", SampleEvent::Tick),
                 (5, "2026-01-01T10:00:01Z", SampleEvent::Tick),
@@ -388,7 +387,7 @@ mod tests {
     #[test]
     fn fuses_on_corrupt_middle_part() {
         let dir = tempdir().expect("tempdir");
-        // part-0000: valid, one row.
+        // First part: valid, one row (hour 10).
         record_stream(
             dir.path(),
             &[Message::new(
@@ -397,10 +396,11 @@ mod tests {
                 SampleEvent::Tick,
             )],
         );
-        // part-0001: garbage (not a parquet file).
-        std::fs::write(dir.path().join("part-0001.parquet"), b"not parquet")
+        // Middle part: garbage (not a parquet file). Its name sorts between the
+        // two valid parts (hour 11).
+        std::fs::write(dir.path().join("20260101T110000Z.parquet"), b"not parquet")
             .expect("write garbage");
-        // part-0002: valid, would-be next rows.
+        // Last part: valid, would-be next rows (hour 12).
         let dir2 = tempdir().expect("tempdir2");
         record_stream(
             dir2.path(),
@@ -411,15 +411,16 @@ mod tests {
             )],
         );
         std::fs::copy(
-            dir2.path().join("part-0000.parquet"),
-            dir.path().join("part-0002.parquet"),
+            dir2.path().join("20260101T120000Z.parquet"),
+            dir.path().join("20260101T120000Z.parquet"),
         )
         .expect("copy");
 
         let reader = SessionReader::<SampleEvent>::open(dir.path()).expect("open");
         let results: Vec<Result<Message<SampleEvent>, Error>> = reader.collect();
 
-        // Ok(0), Err(open/build of part-0001), then NONE — no Ok(9) from part-0002.
+        // Ok(0), Err(open/build of the garbage middle part), then NONE — no Ok(9)
+        // from the last part.
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].as_ref().expect("ok").seq, 0);
         assert!(results[1].is_err());
@@ -450,7 +451,7 @@ mod tests {
         )
         .expect("batch");
 
-        let path = dir.path().join("part-0000.parquet");
+        let path = dir.path().join("20260101T100000Z.parquet");
         let file = std::fs::File::create(&path).expect("create");
         let mut writer = ArrowWriter::try_new(file, crate::part_schema(), None).expect("writer");
         writer.write(&batch).expect("write");
@@ -504,7 +505,7 @@ mod tests {
         )
         .expect("batch");
 
-        let path = dir.path().join("part-0000.parquet");
+        let path = dir.path().join("20260101T100000Z.parquet");
         let file = std::fs::File::create(&path).expect("create");
         let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
         writer.write(&batch).expect("write");
@@ -556,7 +557,7 @@ mod tests {
         };
 
         let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("part-0000.parquet");
+        let path = dir.path().join("20260101T100000Z.parquet");
         let file = std::fs::File::create(&path).expect("create");
         let mut writer = ArrowWriter::try_new(file, crate::part_schema(), None).expect("writer");
         // Two separate batches in the same part file.
@@ -575,16 +576,17 @@ mod tests {
     #[test]
     fn empty_middle_part_is_skipped_not_an_error() {
         let dir = tempdir().expect("tempdir");
-        // part-0000: one row.
+        // First part: one row (hour 10).
         write_raw_part(
-            &dir.path().join("part-0000.parquet"),
+            &dir.path().join("20260101T100000Z.parquet"),
             &[(0, "2026-01-01T10:00:00Z", SampleEvent::Tick)],
         );
-        // part-0001: zero rows (empty batch with the correct schema).
-        write_raw_part(&dir.path().join("part-0001.parquet"), &[]);
-        // part-0002: another row, monotonically after part-0000.
+        // Middle part: zero rows (empty batch with the correct schema). Its name
+        // sorts between the two non-empty parts.
+        write_raw_part(&dir.path().join("20260101T103000Z.parquet"), &[]);
+        // Last part: another row, monotonically after the first (hour 11).
         write_raw_part(
-            &dir.path().join("part-0002.parquet"),
+            &dir.path().join("20260101T110000Z.parquet"),
             &[(1, "2026-01-01T11:00:00Z", SampleEvent::Tick)],
         );
 

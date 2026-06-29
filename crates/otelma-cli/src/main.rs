@@ -25,17 +25,33 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Live-capture Polymarket order books and trades to rolled Parquet parts.
+    ///
+    /// Specify what to record with any mix of `--event`, `--market`, and
+    /// `--asset-id` (all repeatable). `--event`/`--market` accept a bare
+    /// Polymarket slug OR a full `polymarket.com` URL and resolve to token ids
+    /// via the Gamma REST API. At least one must be given.
     Record {
-        /// Polymarket asset (token) id to subscribe to. Repeatable.
-        #[arg(long = "asset-id", required = true)]
+        /// Polymarket event to record (whole event → every live market's
+        /// tokens). Bare slug or `polymarket.com/event/<slug>` URL. Repeatable.
+        #[arg(long = "event")]
+        event: Vec<String>,
+        /// Polymarket market to record (one market → its 2 tokens). Bare slug,
+        /// or a URL with a `marketSlug=` query param. Repeatable.
+        #[arg(long = "market")]
+        market: Vec<String>,
+        /// Raw Polymarket asset (token) id to subscribe to. Repeatable.
+        #[arg(long = "asset-id")]
         asset_id: Vec<String>,
+        /// Also record closed/eliminated markets (default: live markets only).
+        #[arg(long = "include-closed")]
+        include_closed: bool,
         /// Output session directory. Defaults to `recordings/<UTC timestamp>/`.
         #[arg(long)]
         out: Option<PathBuf>,
     },
     /// Replay a recorded session through a summary sink.
     Replay {
-        /// Session directory containing `part-*.parquet` files.
+        /// Session directory of recorded part files (`YYYYMMDDTHHMMSSZ.parquet`).
         session_dir: PathBuf,
         /// Playback speed multiplier (real-time = 1.0, `inf` = as fast as
         /// possible). Omit for headless (fastest) replay.
@@ -66,9 +82,23 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Record { asset_id, out } => {
+        Command::Record {
+            event,
+            market,
+            asset_id,
+            include_closed,
+            out,
+        } => {
+            let sub = commands::resolve_asset_ids(
+                otelma_polymarket::DEFAULT_GAMMA_BASE,
+                &event,
+                &market,
+                &asset_id,
+                include_closed,
+            )
+            .await?;
             let out_dir = out.unwrap_or_else(|| commands::default_session_dir(chrono::Utc::now()));
-            let count = commands::run_record(asset_id, out_dir.clone()).await?;
+            let count = commands::run_record(sub.token_ids, sub.markets, out_dir.clone()).await?;
             println!("recorded {count} messages → {}", out_dir.display());
         }
         Command::Replay {

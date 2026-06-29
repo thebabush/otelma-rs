@@ -1,9 +1,11 @@
 //! [`Recorder`] — writes a message stream to hourly-rolled Parquet part files.
 //!
-//! Each session is a directory of zero-padded part files (`part-0000.parquet`,
-//! `part-0001.parquet`, …). A new part rolls whenever an incoming message falls
-//! into a later UTC-hour bucket than the currently open part, producing
-//! hour-aligned, deterministic files. Idle hours simply yield no part.
+//! Each session is a directory of part files named by the UTC start time of
+//! their first message in basic-ISO form (`20260628T142311Z.parquet`,
+//! `20260628T150000Z.parquet`, …); see [`crate::parts::part_file_name`]. A new
+//! part rolls whenever an incoming message falls into a later UTC-hour bucket
+//! than the currently open part, producing hour-aligned, deterministic files
+//! whose names sort chronologically. Idle hours simply yield no part.
 //!
 //! Rows for the current part are buffered in memory and written as a single
 //! Parquet file (footer and all) when the part rolls or on [`Recorder::close`].
@@ -25,7 +27,7 @@ use crate::codec::encode_payload;
 use crate::error::Error;
 use crate::message::{Message, Payload};
 use crate::monotonic::Monotonicity;
-use crate::parts::{part_schema, zstd_writer_props};
+use crate::parts::{part_file_name, part_schema, zstd_writer_props};
 
 /// Default safety cap on buffered rows before forcing an early roll.
 const DEFAULT_MAX_ROWS: usize = 2_000_000;
@@ -42,28 +44,6 @@ impl HourBucket {
             ts.duration_trunc(TimeDelta::hours(1))
                 .expect("hour truncation is always representable"),
         )
-    }
-}
-
-/// Zero-padded, monotonically increasing part-file index. Owns its filename
-/// formatting so the on-disk naming convention lives in one place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PartIndex(u32);
-
-impl PartIndex {
-    /// The first part of a session.
-    fn first() -> Self {
-        PartIndex(0)
-    }
-
-    /// The next part index.
-    fn next(self) -> Self {
-        PartIndex(self.0 + 1)
-    }
-
-    /// The part file name (e.g. `part-0000.parquet`).
-    fn file_name(self) -> String {
-        format!("part-{:04}.parquet", self.0)
     }
 }
 
@@ -89,10 +69,13 @@ impl PartBuffer {
 /// Writes a message stream to hourly-rolled Parquet part files (ZSTD).
 pub struct Recorder {
     session_dir: PathBuf,
-    part_idx: PartIndex,
     /// UTC hour bucket of the currently open part, or `None` before the first
     /// message is recorded.
     current_hour: Option<HourBucket>,
+    /// Start second of the last part written, used to keep filenames strictly
+    /// increasing (hence chronologically sorted and collision-free) even when a
+    /// safety roll splits a single second into multiple parts.
+    last_part_start: Option<DateTime<Utc>>,
     buffer: PartBuffer,
     props: WriterProperties,
     max_rows: usize,
@@ -114,8 +97,8 @@ impl Recorder {
         let props = zstd_writer_props();
         Ok(Self {
             session_dir,
-            part_idx: PartIndex::first(),
             current_hour: None,
+            last_part_start: None,
             buffer: PartBuffer::default(),
             props,
             max_rows,
@@ -149,19 +132,21 @@ impl Recorder {
         Ok(())
     }
 
-    /// Write the buffered part to disk and advance to the next part index.
+    /// Write the buffered part to disk and reset for the next part.
     fn roll(&mut self) -> Result<(), Error> {
         self.flush_buffer()?;
-        self.part_idx = self.part_idx.next();
         self.current_hour = None;
         Ok(())
     }
 
-    /// Write the buffered rows as a single Parquet file. No-op if empty.
+    /// Write the buffered rows as a single Parquet file named by the part's UTC
+    /// start time. No-op if empty.
     fn flush_buffer(&mut self) -> Result<(), Error> {
         if self.buffer.is_empty() {
             return Ok(());
         }
+        let name = self.next_part_name();
+        let path = self.session_dir.join(name);
         let buffer = std::mem::take(&mut self.buffer);
 
         let seq: ArrayRef = Arc::new(UInt64Array::from(buffer.seq));
@@ -182,12 +167,34 @@ impl Recorder {
             vec![seq, timestamp, type_name, payload],
         )?;
 
-        let path = self.session_dir.join(self.part_idx.file_name());
         let file = fs::File::create(path)?;
         let mut writer = ArrowWriter::try_new(file, schema, Some(self.props.clone()))?;
         writer.write(&batch)?;
         writer.close()?;
         Ok(())
+    }
+
+    /// The file name for the part about to be flushed: its first message's UTC
+    /// timestamp truncated to the second. Names are kept strictly increasing —
+    /// if a part starts in the same second as the previous one (only possible
+    /// when the row-cap safety roll splits a single second), the name is nudged
+    /// one second forward so it stays unique and sorts after its predecessor.
+    /// The buffered rows themselves keep their true timestamps; only the file
+    /// name is adjusted. The caller guarantees the buffer is non-empty.
+    fn next_part_name(&mut self) -> String {
+        let first_micros = self.buffer.timestamp_micros[0];
+        let first_ts = DateTime::<Utc>::from_timestamp_micros(first_micros)
+            .expect("buffered timestamp came from a valid DateTime");
+        let mut start = first_ts
+            .duration_trunc(TimeDelta::seconds(1))
+            .expect("second truncation is always representable");
+        if let Some(last) = self.last_part_start {
+            if start <= last {
+                start = last + TimeDelta::seconds(1);
+            }
+        }
+        self.last_part_start = Some(start);
+        part_file_name(start)
     }
 
     /// Flush the final (partial) part and finish.
@@ -512,5 +519,83 @@ mod tests {
         rec.close().expect("close");
 
         assert_eq!(part_row_counts(dir.path()), vec![1, 1]);
+    }
+
+    /// Part file names are the UTC start time of each part in basic-ISO form:
+    /// the first part takes the recording's actual start instant, and the
+    /// hour-rolled part takes the hour boundary.
+    fn part_names(dir: &std::path::Path) -> Vec<String> {
+        list_parts(dir)
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .expect("name")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parts_named_by_utc_start_time() {
+        let dir = tempdir().expect("tempdir");
+        let mut rec = Recorder::new(dir.path()).expect("recorder");
+        // Starts mid-hour, then crosses into the next UTC hour.
+        rec.record(&Message::new(
+            0,
+            ts("2026-06-28T14:23:11Z"),
+            SampleEvent::Tick,
+        ))
+        .expect("record");
+        rec.record(&Message::new(
+            1,
+            ts("2026-06-28T15:00:00Z"),
+            SampleEvent::Tick,
+        ))
+        .expect("record");
+        rec.close().expect("close");
+
+        assert_eq!(
+            part_names(dir.path()),
+            vec![
+                "20260628T142311Z.parquet".to_string(),
+                "20260628T150000Z.parquet".to_string(),
+            ]
+        );
+    }
+
+    /// Two parts that start in the same second (forced by the row cap) get
+    /// distinct, strictly-increasing names — no clobber — and the stream still
+    /// round-trips in order.
+    #[test]
+    fn same_second_parts_get_distinct_increasing_names() {
+        use crate::SessionReader;
+
+        let dir = tempdir().expect("tempdir");
+        let mut rec = Recorder::with_max_rows(dir.path(), 1).expect("recorder");
+        // Three messages in the SAME second; cap=1 → one part each.
+        let msgs: Vec<Message<SampleEvent>> = (0..3)
+            .map(|i| Message::new(i, ts("2026-06-28T14:23:11Z"), SampleEvent::Tick))
+            .collect();
+        for m in &msgs {
+            rec.record(m).expect("record");
+        }
+        rec.close().expect("close");
+
+        // Names nudge forward one second each to stay unique and sorted.
+        assert_eq!(
+            part_names(dir.path()),
+            vec![
+                "20260628T142311Z.parquet".to_string(),
+                "20260628T142312Z.parquet".to_string(),
+                "20260628T142313Z.parquet".to_string(),
+            ]
+        );
+
+        let read: Vec<Message<SampleEvent>> = SessionReader::<SampleEvent>::open(dir.path())
+            .expect("open")
+            .collect::<Result<_, _>>()
+            .expect("read");
+        assert_eq!(read, msgs);
     }
 }

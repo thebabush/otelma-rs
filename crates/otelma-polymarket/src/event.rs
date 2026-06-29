@@ -91,6 +91,29 @@ pub struct PriceChange {
     pub side: Option<Side>,
 }
 
+/// Human-readable metadata for one market, captured at record start so a
+/// recording is self-contained: a replay can show "Argentina · Yes" instead of
+/// an opaque token id without ever calling the Gamma REST API on the replay
+/// path. Emitted by the WS adapter (not the parser) as the first messages of a
+/// recording, mirroring [`PolyEvent::Connection`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketMeta {
+    /// The market's `conditionId`, if known.
+    pub market: Option<MarketId>,
+    /// The market question, e.g. "Will Argentina win the 2026 FIFA World Cup?".
+    pub question: String,
+    /// The market's `groupItemTitle`, e.g. "Argentina".
+    pub outcome_title: String,
+    /// The "Yes" CLOB token id (`clobTokenIds[0]`).
+    pub yes_asset_id: AssetId,
+    /// The "No" CLOB token id (`clobTokenIds[1]`).
+    pub no_asset_id: AssetId,
+    /// The parent event's title, e.g. "World Cup Winner", if known.
+    pub event_title: Option<String>,
+    /// The market slug, if known.
+    pub market_slug: Option<String>,
+}
+
 /// The Polymarket payload type carried by `otelma::Message`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PolyEvent {
@@ -105,6 +128,9 @@ pub enum PolyEvent {
         /// Whether the venue connection is up.
         connected: bool,
     },
+    /// Market metadata emitted by the WS adapter at recording start (not the
+    /// parser). Lets a replay label assets with human-readable text.
+    Market(MarketMeta),
 }
 
 impl Payload for PolyEvent {
@@ -114,6 +140,7 @@ impl Payload for PolyEvent {
             PolyEvent::Trade(_) => "Trade",
             PolyEvent::PriceChange(_) => "PriceChange",
             PolyEvent::Connection { .. } => "Connection",
+            PolyEvent::Market(_) => "Market",
         }
     }
 }
@@ -154,10 +181,20 @@ mod tests {
             side: None,
         });
         let conn = PolyEvent::Connection { connected: true };
+        let market = PolyEvent::Market(MarketMeta {
+            market: Some("0xcond".into()),
+            question: "Will Argentina win?".to_string(),
+            outcome_title: "Argentina".to_string(),
+            yes_asset_id: "yes".into(),
+            no_asset_id: "no".into(),
+            event_title: Some("World Cup Winner".to_string()),
+            market_slug: Some("will-argentina-win".to_string()),
+        });
         assert_eq!(book.type_name(), "Book");
         assert_eq!(trade.type_name(), "Trade");
         assert_eq!(price_change.type_name(), "PriceChange");
         assert_eq!(conn.type_name(), "Connection");
+        assert_eq!(market.type_name(), "Market");
     }
 
     #[test]

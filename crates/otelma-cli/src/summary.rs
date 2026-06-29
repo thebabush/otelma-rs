@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 
 use chrono::{DateTime, Utc};
 use otelma::{Message, Payload, Sink};
-use otelma_polymarket::{AssetId, PolyEvent, Price, Side};
+use otelma_polymarket::{AssetId, MarketMeta, PolyEvent, Price, Side};
 
 /// Per-asset running tally derived from the stream.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -34,6 +34,9 @@ pub struct SummarySink {
     first_ts: Option<DateTime<Utc>>,
     last_ts: Option<DateTime<Utc>>,
     per_asset: BTreeMap<AssetId, AssetSummary>,
+    /// Human-readable label per asset id, built from `Market` metadata messages.
+    /// A `BTreeMap` (never a `HashMap`) keeps rendering deterministic.
+    labels: BTreeMap<AssetId, String>,
 }
 
 impl SummarySink {
@@ -78,6 +81,10 @@ impl SummarySink {
         if !self.per_asset.is_empty() {
             let _ = writeln!(out, "by asset:");
             for (asset, a) in &self.per_asset {
+                let label = match self.labels.get(asset) {
+                    Some(label) => format!("{asset} ({label})"),
+                    None => asset.to_string(),
+                };
                 let bid = a
                     .best_bid
                     .map(|p| p.value().to_string())
@@ -92,7 +99,7 @@ impl SummarySink {
                     .unwrap_or_else(|| "-".to_string());
                 let _ = writeln!(
                     out,
-                    "  {asset}: bid={bid} ask={ask} trades={} last={last}",
+                    "  {label}: bid={bid} ask={ask} trades={} last={last}",
                     a.trade_count
                 );
             }
@@ -136,7 +143,24 @@ impl Sink<PolyEvent> for SummarySink {
             // by-type tally above.
             PolyEvent::PriceChange(_) => {}
             PolyEvent::Connection { .. } => {}
+            PolyEvent::Market(meta) => {
+                // Record a human-readable label for each of the market's two
+                // assets so the by-asset section can show "Argentina · Yes".
+                self.labels
+                    .insert(meta.yes_asset_id.clone(), asset_label(meta, "Yes"));
+                self.labels
+                    .insert(meta.no_asset_id.clone(), asset_label(meta, "No"));
+            }
         }
+    }
+}
+
+/// Build a human-readable label for one outcome side of a market, e.g.
+/// "World Cup Winner · Argentina · Yes" (event title included when present).
+fn asset_label(meta: &MarketMeta, side: &str) -> String {
+    match &meta.event_title {
+        Some(event) => format!("{event} · {} · {side}", meta.outcome_title),
+        None => format!("{} · {side}", meta.outcome_title),
     }
 }
 
@@ -196,6 +220,16 @@ pub fn render_line(msg: &Message<PolyEvent>) -> String {
             ),
         ),
         PolyEvent::Connection { connected } => ("Connection", format!("connected={connected}")),
+        PolyEvent::Market(m) => (
+            "Market",
+            format!(
+                "{} yes={} no={} ({})",
+                m.outcome_title,
+                m.yes_asset_id,
+                m.no_asset_id,
+                m.event_title.as_deref().unwrap_or(&m.question),
+            ),
+        ),
     };
     format!("{:>8}  {}  {:<10}  {}", msg.seq, msg.timestamp, ty, detail)
 }
@@ -334,6 +368,45 @@ mod tests {
         let a = &sink.per_asset[&asset("A")];
         assert_eq!(a.trade_count, 1);
         assert_eq!(a.last_trade_price, Some(price(dec!(0.40))));
+    }
+
+    #[test]
+    fn market_meta_labels_assets_in_summary_and_print() {
+        use otelma_polymarket::testing::{market_meta, market_meta_msg};
+
+        let mut sink = SummarySink::new();
+        let meta = market_meta("Argentina", "yes-arg", "no-arg", Some("World Cup Winner"));
+        let msg = market_meta_msg(0, 100, meta.clone());
+        sink.apply(&msg);
+        // A book on the Yes leg so the by-asset section lists it.
+        sink.apply(&book(
+            1,
+            110,
+            "yes-arg",
+            vec![lvl(dec!(0.5), dec!(1))],
+            vec![lvl(dec!(0.6), dec!(1))],
+        ));
+
+        let report = sink.render();
+        // The Yes leg is labeled with the event + outcome + side.
+        assert!(
+            report.contains("yes-arg (World Cup Winner · Argentina · Yes)"),
+            "summary should label the asset; got:\n{report}"
+        );
+
+        // render_line prints a readable Market line.
+        let line = render_line(&msg);
+        assert!(line.contains("Market"));
+        assert!(line.contains("Argentina"));
+        assert!(line.contains("yes-arg"));
+        assert!(line.contains("World Cup Winner"));
+    }
+
+    #[test]
+    fn asset_label_without_event_title_omits_event() {
+        use otelma_polymarket::testing::market_meta;
+        let meta = market_meta("Argentina", "y", "n", None);
+        assert_eq!(asset_label(&meta, "Yes"), "Argentina · Yes");
     }
 
     #[test]

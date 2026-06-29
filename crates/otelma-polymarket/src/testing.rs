@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 use otelma::Message;
 use rust_decimal::Decimal;
 
-use crate::event::{BookUpdate, Level, PolyEvent, Trade};
-use crate::types::{Price, Size};
+use crate::event::{BookUpdate, Level, MarketMeta, PolyEvent, Trade};
+use crate::types::{AssetId, MarketId, Price, Size};
 
 /// A UTC timestamp `secs` seconds past the Unix epoch.
 pub fn dt(secs: i64) -> DateTime<Utc> {
@@ -44,6 +44,30 @@ pub fn book_msg(
             exchange_ts_millis: None,
         }),
     )
+}
+
+/// A [`MarketMeta`] value for tests: a market with `outcome_title`, its
+/// `(yes, no)` token ids, and an optional `event_title`.
+pub fn market_meta(
+    outcome_title: &str,
+    yes: &str,
+    no: &str,
+    event_title: Option<&str>,
+) -> MarketMeta {
+    MarketMeta {
+        market: Some(MarketId::from(format!("0x{outcome_title}"))),
+        question: format!("Will {outcome_title} win?"),
+        outcome_title: outcome_title.to_string(),
+        yes_asset_id: AssetId::from(yes),
+        no_asset_id: AssetId::from(no),
+        event_title: event_title.map(str::to_string),
+        market_slug: Some(format!("will-{outcome_title}-win")),
+    }
+}
+
+/// A [`PolyEvent::Market`] message for `meta` at `secs`.
+pub fn market_meta_msg(seq: u64, secs: i64, meta: MarketMeta) -> Message<PolyEvent> {
+    Message::new(seq, dt(secs), PolyEvent::Market(meta))
 }
 
 /// A `Trade` message for `asset` at `secs`. `price`/`size` are raw decimals

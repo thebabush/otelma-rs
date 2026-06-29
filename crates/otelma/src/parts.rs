@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use chrono::{DateTime, Utc};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -43,12 +44,22 @@ pub(crate) fn zstd_writer_props() -> WriterProperties {
         .build()
 }
 
-/// Discover the `part-*.parquet` files in `session_dir`, in ascending part
-/// order (zero-padded names sort lexically into numeric order). Only files
-/// named `part-*.parquet` are included — other parquet files in the directory
-/// (e.g. a `compacted.parquet`) are deliberately ignored, so compacting in
-/// place doesn't make the reader replay the stream twice. A missing directory
-/// is an error; an empty one yields an empty list.
+/// Format a part file name from its start instant: a basic-ISO UTC second
+/// timestamp, e.g. `20260628T142311Z.parquet`. Co-located with [`is_part_file`]
+/// so the on-disk naming convention (generation *and* recognition) lives in one
+/// place. The format is fixed-width and colon-free, so names sort lexically into
+/// chronological order and are valid filenames on every platform.
+pub(crate) fn part_file_name(start: DateTime<Utc>) -> String {
+    format!("{}.parquet", start.format("%Y%m%dT%H%M%SZ"))
+}
+
+/// Discover the part files in `session_dir`, in chronological order (the
+/// basic-ISO UTC names are fixed-width, so a lexical sort *is* chronological).
+/// Only files matching the part naming convention (see [`part_file_name`]) are
+/// included — other parquet files in the directory (e.g. a `compacted.parquet`)
+/// are deliberately ignored, so compacting in place doesn't make the reader
+/// replay the stream twice. A missing directory is an error; an empty one yields
+/// an empty list.
 pub fn part_paths(session_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> {
     let mut parts: Vec<PathBuf> = std::fs::read_dir(session_dir)?
         .map(|entry| entry.map(|e| e.path()))
@@ -60,12 +71,29 @@ pub fn part_paths(session_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Error> 
     Ok(parts)
 }
 
-/// Whether `path` is a session part file (`part-*.parquet`).
+/// Whether `path` is a session part file, i.e. its name is a basic-ISO UTC
+/// second timestamp with a `.parquet` extension (`YYYYMMDDTHHMMSSZ.parquet`).
+/// This recognizes exactly what [`part_file_name`] produces and so excludes
+/// foreign parquet files such as `compacted.parquet`.
 fn is_part_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    name.starts_with("part-") && name.ends_with(".parquet")
+    name.strip_suffix(".parquet")
+        .is_some_and(is_basic_iso_utc_second)
+}
+
+/// Whether `s` is a basic-ISO UTC second timestamp: `YYYYMMDDTHHMMSSZ` — eight
+/// date digits, `T`, six time digits, `Z` (sixteen ASCII bytes). Pure shape
+/// check (not a calendar validation); it just distinguishes our part names from
+/// other files in the directory.
+fn is_basic_iso_utc_second(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 16
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'T'
+        && b[9..15].iter().all(u8::is_ascii_digit)
+        && b[15] == b'Z'
 }
 
 /// Merge a session's rolled parts into a single Parquet file at `out`,
@@ -98,8 +126,8 @@ mod tests {
     fn part_paths_ignores_non_part_parquet() {
         let dir = tempfile::tempdir().expect("tempdir");
         let touch = |name: &str| std::fs::File::create(dir.path().join(name)).expect("touch");
-        touch("part-0001.parquet");
-        touch("part-0000.parquet");
+        touch("20260628T150000Z.parquet");
+        touch("20260628T140000Z.parquet");
         touch("compacted.parquet"); // must be ignored
         touch("notes.txt"); // non-parquet, ignored
 
@@ -108,16 +136,23 @@ mod tests {
             .iter()
             .map(|p| p.file_name().and_then(|n| n.to_str()).expect("name"))
             .collect();
-        // Only part files, in ascending order.
-        assert_eq!(names, vec!["part-0000.parquet", "part-0001.parquet"]);
+        // Only part files, in chronological (== lexical) order.
+        assert_eq!(
+            names,
+            vec!["20260628T140000Z.parquet", "20260628T150000Z.parquet"]
+        );
     }
 
     #[test]
-    fn is_part_file_matches_only_part_prefix() {
-        assert!(is_part_file(Path::new("/x/part-0000.parquet")));
+    fn is_part_file_matches_basic_iso_utc_names() {
+        assert!(is_part_file(Path::new("/x/20260628T142311Z.parquet")));
+        assert!(is_part_file(Path::new("/x/20260628T000000Z.parquet")));
+        // Foreign / legacy / malformed names are not part files.
         assert!(!is_part_file(Path::new("/x/compacted.parquet")));
-        assert!(!is_part_file(Path::new("/x/part-0000.txt")));
-        assert!(!is_part_file(Path::new("/x/0000.parquet")));
+        assert!(!is_part_file(Path::new("/x/part-0000.parquet"))); // old scheme
+        assert!(!is_part_file(Path::new("/x/20260628T142311Z.txt")));
+        assert!(!is_part_file(Path::new("/x/20260628T1423Z.parquet"))); // wrong width
+        assert!(!is_part_file(Path::new("/x/2026-06-28T14:23:11Z.parquet"))); // extended ISO
     }
 
     /// Compacting an empty session directory produces a valid Parquet file that

@@ -79,7 +79,8 @@ every downstream computation. Crashing loudly on read is the safe default.
 
 Illegal states are made unrepresentable where it's cheap to do so: part-hour
 buckets are hour-aligned by construction (constructible only by truncating a
-timestamp), part indices own their zero-padded filename formatting, `Side` and
+timestamp), part files are named by their UTC start time so the name *is* the
+chronological sort key, `Side` and
 the event payloads are enums, and the venue parser follows parse-don't-validate
 at the boundary (skip unknown shapes, crash on corrupt-known ones). Internal code
 stays free of `isinstance`-style dispatch; the type system handles it.
