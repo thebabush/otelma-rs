@@ -6,3 +6,8 @@
 # Local Claude plugin opt-in markers (personal tooling, not part of the project)
 .nonna
 .rrr
+
+# Local agent briefs (not part of the published project)
+AGENTS.md
+CLAUDE.md
+
