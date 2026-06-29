@@ -19,6 +19,7 @@ mod app;
 mod feeder;
 mod live;
 mod state;
+mod theme;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

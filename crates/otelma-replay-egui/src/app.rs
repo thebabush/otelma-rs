@@ -1,11 +1,17 @@
-//! The eframe application: reads shared [`ReplayState`] each frame and renders
-//! price plots, a depth view, and playback controls.
+//! The eframe application: a terminal-style shell (title bar, toolbar, footer)
+//! around a flexible body that hosts the price chart (or a CHAIN placeholder).
+//!
+//! Strict layering: this file is the **render layer** — egui only, no business
+//! logic. The view-model lives in [`crate::state`] (egui-free); the typed design
+//! tokens, fonts, and the pure mode/tz/stat helpers live in [`crate::theme`].
 //!
 //! Targets eframe 0.35's wgpu-default `App` API: the required entry point is
 //! [`eframe::App::ui`] (a root [`egui::Ui`] with no margin), inside which we lay
 //! out panels via `Panel::show(ui, …)`.
 
-use eframe::egui;
+use std::time::Instant;
+
+use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Line, MarkerShape, Plot, Points};
 
 use otelma_polymarket::AssetId;
@@ -13,6 +19,7 @@ use otelma_polymarket::AssetId;
 use crate::feeder::Feeder;
 use crate::live::LiveFeeder;
 use crate::state::ReplayState;
+use crate::theme::{self, Accent, Mode, Timezone, ViewMode};
 
 /// As-fast-as-possible speed.
 const FAST_SPEED: f64 = f64::INFINITY;
@@ -20,8 +27,13 @@ const FAST_SPEED: f64 = f64::INFINITY;
 const SPEED_MIN: f64 = 0.5;
 const SPEED_MAX: f64 = 1000.0;
 
+/// Fixed bar heights (px), per the design spec.
+const TITLE_BAR_H: f32 = 32.0;
+const TOOLBAR_H: f32 = 44.0;
+const FOOTER_H: f32 = 24.0;
+
 /// The data source the app renders: a paced replay (with playback controls) or
-/// a live capture (no pacing — the controls are meaningless and hidden).
+/// a live capture (no pacing — the controls are locked/dimmed).
 enum Source {
     /// Replay a recorded session from disk, paced by a [`Feeder`].
     Replay {
@@ -35,6 +47,14 @@ enum Source {
 }
 
 impl Source {
+    /// The replayer mode this source represents.
+    fn mode(&self) -> Mode {
+        match self {
+            Source::Replay { .. } => Mode::Replay,
+            Source::Live { .. } => Mode::Live,
+        }
+    }
+
     /// Snapshot the shared state under a short lock, whatever the mode.
     fn snapshot(&self) -> ReplayState {
         let state = match self {
@@ -57,6 +77,16 @@ impl Source {
 pub struct ReplayApp {
     source: Source,
     selected_asset: Option<AssetId>,
+    /// Which body view is shown.
+    view: ViewMode,
+    /// Displayed timezone for every timestamp (source is UTC; default LOCAL).
+    tz: Timezone,
+    /// Whether fonts/visuals have been installed (done on first frame, where we
+    /// have a `Context`).
+    styled: bool,
+    /// Wall-clock origin for the pill-blink animation (display-only — not on the
+    /// determinism path).
+    started: Instant,
 }
 
 impl ReplayApp {
@@ -64,21 +94,26 @@ impl ReplayApp {
     pub fn new(feeder: Feeder) -> Self {
         let speed = feeder.control.speed();
         let fast = !speed.is_finite();
-        Self {
-            source: Source::Replay {
-                last_finite_speed: if fast { 1.0 } else { speed },
-                fast,
-                feeder,
-            },
-            selected_asset: None,
-        }
+        Self::with_source(Source::Replay {
+            last_finite_speed: if fast { 1.0 } else { speed },
+            fast,
+            feeder,
+        })
     }
 
     /// Build the app over a started [`LiveFeeder`] (live capture + monitor).
     pub fn new_live(feeder: LiveFeeder) -> Self {
+        Self::with_source(Source::Live { feeder })
+    }
+
+    fn with_source(source: Source) -> Self {
         Self {
-            source: Source::Live { feeder },
+            source,
             selected_asset: None,
+            view: ViewMode::Chart,
+            tz: Timezone::Local,
+            styled: false,
+            started: Instant::now(),
         }
     }
 
@@ -87,109 +122,321 @@ impl ReplayApp {
         self.source.snapshot()
     }
 
-    fn controls_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
-        // `restart` re-opens the reader; clear the selection afterwards. Tracked
-        // here so the closure can borrow `self.source` mutably without also
-        // touching `self.selected_asset`.
-        let mut restarted = false;
-        match &mut self.source {
-            Source::Replay {
-                feeder,
-                last_finite_speed,
-                fast,
-            } => {
-                ui.horizontal(|ui| {
-                    let paused = feeder.control.is_paused();
-                    if ui
-                        .button(if paused { "▶ Play" } else { "⏸ Pause" })
-                        .clicked()
-                    {
-                        if paused {
-                            feeder.control.resume();
-                        } else {
-                            feeder.control.pause();
-                        }
-                    }
-                    if ui.button("⟲ Restart").clicked() {
-                        feeder.restart();
-                        restarted = true;
-                    }
+    // ── Title bar ────────────────────────────────────────────────────────────
 
-                    ui.separator();
-
-                    let mut want_fast = *fast;
-                    if ui.checkbox(&mut want_fast, "As fast as possible").changed() {
-                        *fast = want_fast;
-                        if want_fast {
-                            feeder.control.set_speed(FAST_SPEED);
-                        } else {
-                            feeder.control.set_speed(*last_finite_speed);
-                        }
-                    }
-
-                    ui.add_enabled_ui(!*fast, |ui| {
-                        let mut speed = *last_finite_speed;
-                        let slider = egui::Slider::new(&mut speed, SPEED_MIN..=SPEED_MAX)
-                            .logarithmic(true)
-                            .text("speed ×");
-                        if ui.add(slider).changed() {
-                            *last_finite_speed = speed;
-                            feeder.control.set_speed(speed);
-                        }
-                    });
-                });
+    fn title_bar_ui(&mut self, ui: &mut egui::Ui, mode: Mode, accent: Accent) {
+        ui.horizontal_centered(|ui| {
+            ui.add_space(6.0);
+            // Decorative macOS-style dots.
+            for _ in 0..3 {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 4.5, theme::DOT);
+                ui.add_space(3.0);
             }
-            Source::Live { feeder } => {
-                // Live: no pacing/scrubbing/restart — show a recording status line.
-                let seq = state
-                    .current_seq
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "—".to_string());
-                ui.colored_label(
-                    egui::Color32::LIGHT_RED,
-                    format!(
-                        "● LIVE — recording to {} · {} events · seq {seq}",
-                        feeder.out_dir.display(),
-                        state.message_count,
-                    ),
-                );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("otelma · replayer")
+                    .size(11.0)
+                    .color(theme::TEXT_TITLE),
+            );
+
+            ui.add_space(14.0);
+            self.view_switch_ui(ui, accent);
+
+            // Spacer pushes the mode pill to the far right.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                self.mode_pill_ui(ui, mode, accent);
+            });
+        });
+    }
+
+    /// `[ CHART | CHAIN ]` segmented view switch.
+    fn view_switch_ui(&mut self, ui: &mut egui::Ui, accent: Accent) {
+        egui::Frame::default()
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
+            .corner_radius(5.0)
+            .inner_margin(egui::Margin::symmetric(2, 1))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (i, mode) in [ViewMode::Chart, ViewMode::Chain].into_iter().enumerate() {
+                    if i == 1 {
+                        // Divider between segments.
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(1.0, 14.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 0.0, theme::BORDER_STRONG);
+                    }
+                    let active = self.view == mode;
+                    let label = match mode {
+                        ViewMode::Chart => "CHART",
+                        ViewMode::Chain => "CHAIN",
+                    };
+                    let (text_color, bg) = if active {
+                        (accent.base, accent.soft)
+                    } else {
+                        (theme::TEXT_DIMMER, Color32::TRANSPARENT)
+                    };
+                    let resp = egui::Frame::default()
+                        .fill(bg)
+                        .inner_margin(egui::Margin::symmetric(12, 4))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(label).size(10.0).color(text_color));
+                        })
+                        .response
+                        .interact(egui::Sense::click());
+                    if resp.clicked() {
+                        self.view = mode;
+                    }
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+            });
+    }
+
+    /// Far-right mode pill (REPLAY fuchsia / LIVE cyan) with a blinking dot.
+    fn mode_pill_ui(&self, ui: &mut egui::Ui, mode: Mode, accent: Accent) {
+        let opacity = theme::blink_opacity(self.started.elapsed().as_secs_f64());
+        // Blend the (blink-faded) accent dot over the pill's soft fill.
+        let dot = accent.soft.blend(accent.base.gamma_multiply(opacity));
+        egui::Frame::default()
+            .fill(accent.soft)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
+            .corner_radius(5.0)
+            .inner_margin(egui::Margin::symmetric(12, 4))
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 3.0, dot);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(theme::mode_label(mode))
+                            .size(10.0)
+                            .color(accent.base),
+                    );
+                });
+            });
+    }
+
+    // ── Toolbar ──────────────────────────────────────────────────────────────
+
+    fn toolbar_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState, mode: Mode, accent: Accent) {
+        ui.horizontal_centered(|ui| {
+            ui.add_space(8.0);
+            // Left group: playback controls (disabled/dimmed in LIVE).
+            ui.add_enabled_ui(theme::controls_enabled(mode), |ui| {
+                self.playback_controls_ui(ui, accent);
+            });
+
+            // Right group: timestamp + TZ toggle + stats (always enabled).
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                self.stats_ui(ui, state, mode);
+                ui.add_space(10.0);
+                self.timestamp_ui(ui, state);
+            });
+        });
+    }
+
+    fn playback_controls_ui(&mut self, ui: &mut egui::Ui, accent: Accent) {
+        // Only meaningful for Replay; Live renders these disabled via the
+        // enclosing `add_enabled_ui`, so just no-op the wiring there.
+        let Source::Replay {
+            feeder,
+            last_finite_speed,
+            fast,
+        } = &mut self.source
+        else {
+            // LIVE: draw inert spec'd controls so the disabled state is visible.
+            ui.label(RichText::new("▶ Play").size(11.0).color(theme::TEXT_BRIGHT));
+            ui.label(RichText::new("↺ Restart").size(11.0).color(theme::TEXT_DIM));
+            ui.label(RichText::new("SPEED").size(9.5).color(theme::TEXT_LABEL));
+            return;
+        };
+
+        let paused = feeder.control.is_paused();
+        let glyph = if paused { "▶" } else { "❚❚" };
+        let label = if paused { "Play" } else { "Pause" };
+        let play = ui.button(
+            RichText::new(format!("{glyph} {label}"))
+                .size(11.0)
+                .color(theme::TEXT_BRIGHT),
+        );
+        let _ = accent; // accent glyph tint is a later visual refinement.
+        if play.clicked() {
+            if paused {
+                feeder.control.resume();
+            } else {
+                feeder.control.pause();
             }
         }
-        if restarted {
+
+        if ui
+            .button(RichText::new("↺ Restart").size(11.0).color(theme::TEXT_DIM))
+            .clicked()
+        {
+            feeder.restart();
             self.selected_asset = None;
         }
 
-        ui.horizontal(|ui| {
-            let sim_t = match (state.start_ts, state.current_ts) {
-                (Some(start), Some(now)) => {
-                    format!("{:.1}s", (now - start).num_milliseconds() as f64 / 1000.0)
-                }
-                _ => "—".to_string(),
-            };
-            let seq = state
-                .current_seq
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "—".to_string());
-            ui.label(format!("sim time: {sim_t}"));
-            ui.separator();
-            ui.label(format!("seq: {seq}"));
-            ui.separator();
-            ui.label(format!("messages: {}", state.message_count));
+        ui.separator();
+
+        ui.label(RichText::new("SPEED").size(9.5).color(theme::TEXT_LABEL));
+        ui.add_enabled_ui(!*fast, |ui| {
+            let mut speed = *last_finite_speed;
+            let slider = egui::Slider::new(&mut speed, SPEED_MIN..=SPEED_MAX)
+                .logarithmic(true)
+                .suffix("×");
+            if ui.add(slider).changed() {
+                *last_finite_speed = speed;
+                feeder.control.set_speed(speed);
+            }
+        });
+
+        let mut want_fast = *fast;
+        if ui.checkbox(&mut want_fast, "max").changed() {
+            *fast = want_fast;
+            if want_fast {
+                feeder.control.set_speed(FAST_SPEED);
+            } else {
+                feeder.control.set_speed(*last_finite_speed);
+            }
+        }
+    }
+
+    fn timestamp_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
+        // Clickable TZ toggle (drawn first because we lay out right-to-left).
+        let tz_resp = ui
+            .label(
+                RichText::new(self.tz.label())
+                    .size(9.0)
+                    .color(theme::TEXT_TITLE)
+                    .underline(),
+            )
+            .interact(egui::Sense::click());
+        if tz_resp.clicked() {
+            self.tz = self.tz.toggled();
+        }
+        if tz_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        let ts = match state.current_ts {
+            Some(ts) => theme::format_timestamp(ts, self.tz),
+            None => "—".to_string(),
+        };
+        ui.label(RichText::new(ts).size(11.0).color(theme::TEXT_PRIMARY));
+        ui.label(RichText::new("⧗").size(10.0).color(theme::TEXT_DIMMER));
+    }
+
+    fn stats_ui(&self, ui: &mut egui::Ui, state: &ReplayState, mode: Mode) {
+        // Laid out right-to-left: render msg, then seq.
+        let seq = state
+            .current_seq
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "—".to_string());
+        // Total message count is not cheaply known from the streaming reader yet,
+        // so REPLAY falls back to a running count (the `cur / total` form lands
+        // with the scrubber in a later deliverable).
+        let msg = theme::format_msg_stat(mode, state.message_count, None);
+
+        ui.label(
+            RichText::new(&msg)
+                .size(11.0)
+                .color(theme::TEXT_PRIMARY)
+                .strong(),
+        );
+        ui.label(RichText::new("msg").size(11.0).color(theme::TEXT_DIMMER));
+        ui.separator();
+        ui.label(
+            RichText::new(&seq)
+                .size(11.0)
+                .color(theme::TEXT_PRIMARY)
+                .strong(),
+        );
+        ui.label(RichText::new("seq").size(11.0).color(theme::TEXT_DIMMER));
+    }
+
+    // ── Footer ───────────────────────────────────────────────────────────────
+
+    fn footer_ui(&self, ui: &mut egui::Ui, mode: Mode) {
+        ui.horizontal_centered(|ui| {
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("space play/pause   ← → step frame   R restart")
+                    .size(10.0)
+                    .color(theme::TEXT_FAINT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(10.0);
+                let note = match (mode, &self.source) {
+                    (Mode::Replay, _) => String::new(),
+                    (Mode::Live, Source::Live { feeder }) => {
+                        format!(
+                            "recording live · controls locked · {}",
+                            feeder.out_dir.display()
+                        )
+                    }
+                    // Mode and source always agree; this arm is unreachable.
+                    (Mode::Live, Source::Replay { .. }) => {
+                        "recording live · controls locked".to_string()
+                    }
+                };
+                ui.label(RichText::new(note).size(10.0).color(theme::TEXT_FAINT));
+            });
+        });
+    }
+
+    // ── Body ─────────────────────────────────────────────────────────────────
+
+    fn body_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
+        match self.view {
+            ViewMode::Chart => self.chart_body_ui(ui, state),
+            ViewMode::Chain => self.chain_placeholder_ui(ui),
+        }
+    }
+
+    /// CHART body: the existing egui_plot chart + depth, reparented into the
+    /// center. (The bespoke chart painter / order-book ladder land later.)
+    fn chart_body_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
+        egui::Panel::right("depth")
+            .frame(egui::Frame::default().fill(theme::BG_WINDOW))
+            .show(ui, |ui| {
+                self.depth_ui(ui, state);
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(theme::BG_WINDOW))
+            .show(ui, |ui| {
+                self.asset_selector_ui(ui, state);
+                self.price_plot_ui(ui, state);
+            });
+    }
+
+    fn chain_placeholder_ui(&self, ui: &mut egui::Ui) {
+        ui.centered_and_justified(|ui| {
+            ui.label(
+                RichText::new("CHAIN view — coming in a later deliverable")
+                    .size(11.0)
+                    .color(theme::TEXT_DIMMER),
+            );
         });
     }
 
     fn asset_selector_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
         let assets = state.asset_ids();
         if assets.is_empty() {
-            ui.label("waiting for data…");
+            ui.label(
+                RichText::new("waiting for data…")
+                    .size(11.0)
+                    .color(theme::TEXT_DIMMER),
+            );
             return;
         }
-        // Default to the first asset once data arrives.
         if self.selected_asset.is_none() {
             self.selected_asset = assets.first().cloned();
         }
         ui.horizontal(|ui| {
-            ui.label("asset:");
             for asset in &assets {
                 let selected = self.selected_asset.as_ref() == Some(asset);
                 if ui
@@ -210,8 +457,6 @@ impl ReplayApp {
             return;
         };
 
-        ui.label(egui::RichText::new(state.label_for(asset)).strong());
-
         let bid: Vec<[f64; 2]> = a
             .book_series
             .iter()
@@ -226,7 +471,6 @@ impl ReplayApp {
         let trades: Vec<[f64; 2]> = a.trades.iter().map(|p| [p.t_secs, p.price]).collect();
 
         Plot::new("price_plot")
-            .height(280.0)
             .legend(egui_plot::Legend::default())
             .x_axis_label("t (s)")
             .y_axis_label("price")
@@ -243,28 +487,30 @@ impl ReplayApp {
     }
 
     fn depth_ui(&self, ui: &mut egui::Ui, state: &ReplayState) {
+        ui.label(
+            RichText::new("ORDER BOOK")
+                .size(9.5)
+                .color(theme::TEXT_FAINT),
+        );
         let Some(asset) = self.selected_asset.as_ref() else {
             return;
         };
         let Some(a) = state.assets.get(asset) else {
             return;
         };
-
-        ui.label(egui::RichText::new("current depth").strong());
         egui::Grid::new("depth_grid").striped(true).show(ui, |ui| {
             ui.label("side");
             ui.label("price");
             ui.label("size");
             ui.end_row();
-            // Asks high→low above bids, then bids.
             for (price, size) in a.depth_asks.iter().rev() {
-                ui.colored_label(egui::Color32::LIGHT_RED, "ask");
+                ui.colored_label(theme::RED, "ask");
                 ui.label(format!("{price:.3}"));
                 ui.label(format!("{size:.0}"));
                 ui.end_row();
             }
             for (price, size) in &a.depth_bids {
-                ui.colored_label(egui::Color32::LIGHT_GREEN, "bid");
+                ui.colored_label(theme::GREEN, "bid");
                 ui.label(format!("{price:.3}"));
                 ui.label(format!("{size:.0}"));
                 ui.end_row();
@@ -276,27 +522,57 @@ impl ReplayApp {
 impl eframe::App for ReplayApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if !self.styled {
+            theme::install_fonts(&ctx);
+            let mut visuals = egui::Visuals::dark();
+            visuals.panel_fill = theme::BG_WINDOW;
+            visuals.window_fill = theme::BG_WINDOW;
+            visuals.override_text_color = Some(theme::TEXT_PRIMARY);
+            ctx.set_visuals(visuals);
+            self.styled = true;
+        }
+
+        let mode = self.source.mode();
+        let accent = theme::accent_for(mode);
         let state = self.snapshot();
 
-        let heading = match self.source {
-            Source::Replay { .. } => "otelma replayer",
-            Source::Live { .. } => "otelma live monitor",
-        };
-        egui::Panel::top("controls").show(ui, |ui| {
-            ui.heading(heading);
-            self.controls_ui(ui, &state);
-            self.asset_selector_ui(ui, &state);
-        });
+        egui::Panel::top("title_bar")
+            .exact_size(TITLE_BAR_H)
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::BG_TITLE)
+                    .inner_margin(egui::Margin::symmetric(8, 0)),
+            )
+            .show_separator_line(true)
+            .show(ui, |ui| {
+                self.title_bar_ui(ui, mode, accent);
+            });
 
-        egui::Panel::right("depth").show(ui, |ui| {
-            self.depth_ui(ui, &state);
-        });
+        egui::Panel::top("toolbar")
+            .exact_size(TOOLBAR_H)
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::BG_TOOLBAR)
+                    .inner_margin(egui::Margin::symmetric(4, 0)),
+            )
+            .show(ui, |ui| {
+                self.toolbar_ui(ui, &state, mode, accent);
+            });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.price_plot_ui(ui, &state);
-        });
+        egui::Panel::bottom("footer")
+            .exact_size(FOOTER_H)
+            .frame(egui::Frame::default().fill(theme::BG_TOOLBAR))
+            .show(ui, |ui| {
+                self.footer_ui(ui, mode);
+            });
 
-        // Keep animating while replaying.
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(theme::BG_WINDOW))
+            .show(ui, |ui| {
+                self.body_ui(ui, &state);
+            });
+
+        // Animate the pill blink and any live/replay progress.
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 
