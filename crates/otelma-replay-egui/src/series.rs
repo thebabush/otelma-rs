@@ -148,6 +148,38 @@ pub fn format_volume(v: f64) -> String {
     }
 }
 
+/// Number of order-book levels shown per side in the ladder.
+pub const LADDER_DEPTH: usize = 8;
+
+/// The order-book ladder for one side, prepared for rendering: up to
+/// [`LADDER_DEPTH`] `(price, size)` levels plus the max size across them (for
+/// depth-bar scaling). Pure view-model math — the renderer only maps these to
+/// pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LadderSide {
+    /// Up to [`LADDER_DEPTH`] levels, in the input order (already best-first as
+    /// produced by the book).
+    pub levels: Vec<(f64, f64)>,
+    /// The largest `size` among `levels` (`0.0` when empty), for bar scaling.
+    pub max_size: f64,
+}
+
+impl LadderSide {
+    /// Clamp `levels` to the best [`LADDER_DEPTH`] (the input is best-first), and
+    /// compute the max size for depth-bar scaling.
+    pub fn from_levels(levels: &[(f64, f64)]) -> Self {
+        let clamped: Vec<(f64, f64)> = levels.iter().take(LADDER_DEPTH).copied().collect();
+        let max_size = clamped
+            .iter()
+            .map(|(_, size)| *size)
+            .fold(0.0_f64, f64::max);
+        Self {
+            levels: clamped,
+            max_size,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +285,25 @@ mod tests {
         };
         assert_eq!(max_visible_volume(empty, &vols), None);
         assert_eq!(max_visible_volume(w, &[]), None);
+    }
+
+    #[test]
+    fn ladder_side_clamps_to_eight_and_finds_max_size() {
+        // Ten levels, best-first; only the first 8 survive.
+        let levels: Vec<(f64, f64)> = (0..10).map(|i| (0.5 - i as f64 * 0.01, i as f64)).collect();
+        let side = LadderSide::from_levels(&levels);
+        assert_eq!(side.levels.len(), LADDER_DEPTH);
+        // The first 8 levels have sizes 0..=7 → max 7.
+        assert_eq!(side.max_size, 7.0);
+        // Best (input-first) level is preserved at the front.
+        assert_eq!(side.levels[0], (0.5, 0.0));
+    }
+
+    #[test]
+    fn ladder_side_empty_has_zero_max() {
+        let side = LadderSide::from_levels(&[]);
+        assert!(side.levels.is_empty());
+        assert_eq!(side.max_size, 0.0);
     }
 
     #[test]

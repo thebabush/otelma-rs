@@ -9,14 +9,23 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow::array::{Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use parquet::file::statistics::Statistics;
 
 use crate::error::Error;
+
+/// The `timestamp` column index in the [`part_schema`] (µs-since-epoch, UTC).
+const TIMESTAMP_COLUMN: usize = 1;
+
+/// A recording's wall-clock span: `(first message timestamp, last message
+/// timestamp)`, both UTC. Returned by [`session_time_bounds`].
+pub type TimeBounds = (DateTime<Utc>, DateTime<Utc>);
 
 /// The Arrow schema shared by every part file (and the compacted file).
 ///
@@ -126,6 +135,117 @@ pub fn compact_session(session_dir: impl AsRef<Path>, out: impl AsRef<Path>) -> 
     Ok(())
 }
 
+/// A recording's wall-clock span: the first message's timestamp and the last
+/// message's timestamp (both UTC). `None` for an empty session (no parts, or
+/// parts with no rows).
+///
+/// This is engine introspection — it reports the recorded timeline, not any UI
+/// concept. It is intentionally **cheap**: the earliest timestamp is read from
+/// the first part and the latest from the last part. Because the stream is
+/// monotonic (the reader enforces non-decreasing timestamps across the whole
+/// session), the global minimum lives in the first part and the global maximum
+/// in the last. Within a part we prefer the timestamp column's min/max
+/// statistics (read from Parquet metadata, no row decode); when a part carries no
+/// statistics we fall back to scanning just that part's timestamp column.
+pub fn session_time_bounds(session_dir: impl AsRef<Path>) -> Result<Option<TimeBounds>, Error> {
+    let parts = part_paths(session_dir)?;
+    let Some(first) = parts.first() else {
+        return Ok(None);
+    };
+    let last = parts.last().expect("non-empty parts has a last");
+
+    let Some((start, _)) = part_time_bounds(first)? else {
+        return Ok(None);
+    };
+    // Single part: its own max is the session end; avoid re-reading it.
+    let end = if parts.len() == 1 {
+        part_time_bounds(first)?
+            .expect("first part had a min, so it has a max")
+            .1
+    } else {
+        match part_time_bounds(last)? {
+            Some((_, end)) => end,
+            // A trailing empty part: the end is the first part's max.
+            None => {
+                part_time_bounds(first)?
+                    .expect("first part had a min, so it has a max")
+                    .1
+            }
+        }
+    };
+    Ok(Some((start, end)))
+}
+
+/// The `(min, max)` timestamp of a single part file, or `None` if it has no
+/// rows. Prefers the Parquet timestamp-column statistics (metadata only); falls
+/// back to scanning the timestamp column when statistics are absent.
+fn part_time_bounds(path: &Path) -> Result<Option<TimeBounds>, Error> {
+    let file = std::fs::File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+
+    if let Some(bounds) = stats_time_bounds(builder.metadata())? {
+        return Ok(Some(bounds));
+    }
+
+    // No usable statistics: scan just this part's timestamp column.
+    let reader = builder.build()?;
+    let mut min: Option<i64> = None;
+    let mut max: Option<i64> = None;
+    for batch in reader {
+        let batch = batch?;
+        let col = batch
+            .column(TIMESTAMP_COLUMN)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or(Error::SchemaColumn {
+                column: "timestamp",
+            })?;
+        for i in 0..col.len() {
+            if col.is_null(i) {
+                continue;
+            }
+            let v = col.value(i);
+            min = Some(min.map_or(v, |m| m.min(v)));
+            max = Some(max.map_or(v, |m| m.max(v)));
+        }
+    }
+    match (min, max) {
+        (Some(lo), Some(hi)) => Ok(Some((micros_to_utc(lo)?, micros_to_utc(hi)?))),
+        _ => Ok(None),
+    }
+}
+
+/// Fold the timestamp-column min/max across all row groups from Parquet
+/// statistics, without decoding any row. `Ok(None)` when no row group carries
+/// usable int64 statistics for that column (caller falls back to a scan).
+fn stats_time_bounds(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+) -> Result<Option<TimeBounds>, Error> {
+    let mut min: Option<i64> = None;
+    let mut max: Option<i64> = None;
+    for rg in metadata.row_groups() {
+        let col = rg.column(TIMESTAMP_COLUMN);
+        if let Some(Statistics::Int64(stats)) = col.statistics() {
+            if let Some(lo) = stats.min_opt() {
+                min = Some(min.map_or(*lo, |m| m.min(*lo)));
+            }
+            if let Some(hi) = stats.max_opt() {
+                max = Some(max.map_or(*hi, |m| m.max(*hi)));
+            }
+        }
+    }
+    match (min, max) {
+        (Some(lo), Some(hi)) => Ok(Some((micros_to_utc(lo)?, micros_to_utc(hi)?))),
+        _ => Ok(None),
+    }
+}
+
+/// Convert microseconds-since-epoch to a UTC instant, mirroring the reader's
+/// out-of-range handling.
+fn micros_to_utc(micros: i64) -> Result<DateTime<Utc>, Error> {
+    DateTime::<Utc>::from_timestamp_micros(micros).ok_or(Error::TimestampOutOfRange { micros })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +332,121 @@ mod tests {
             .expect("reader");
         let compacted_rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
         assert_eq!(compacted_rows, original.len());
+    }
+
+    /// An empty session has no time bounds.
+    #[test]
+    fn session_time_bounds_empty_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(session_time_bounds(dir.path()).expect("bounds"), None);
+    }
+
+    /// The bounds are the first message's timestamp and the last message's
+    /// timestamp, spanning multiple rolled parts. The sample stream rolls into
+    /// several hourly parts, so this exercises the first-part-min /
+    /// last-part-max path (via Parquet statistics).
+    #[test]
+    fn session_time_bounds_spans_first_to_last_message() {
+        use crate::message::Message;
+        use crate::test_support::{record_stream, ts, SampleEvent};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stream = [
+            Message::new(0, ts("2026-01-01T10:00:00Z"), SampleEvent::Tick),
+            Message::new(1, ts("2026-01-01T10:30:00Z"), SampleEvent::Tick),
+            // A later hour → a second rolled part.
+            Message::new(2, ts("2026-01-01T12:15:30Z"), SampleEvent::Tick),
+        ];
+        record_stream(dir.path(), &stream);
+        // Two parts were written (hour 10 and hour 12).
+        assert_eq!(part_paths(dir.path()).expect("parts").len(), 2);
+
+        let (start, end) = session_time_bounds(dir.path())
+            .expect("bounds")
+            .expect("non-empty");
+        assert_eq!(start, ts("2026-01-01T10:00:00Z"));
+        assert_eq!(end, ts("2026-01-01T12:15:30Z"));
+    }
+
+    /// A single-part session reports that part's own min/max as the bounds.
+    #[test]
+    fn session_time_bounds_single_part() {
+        use crate::message::Message;
+        use crate::test_support::{record_stream, ts, SampleEvent};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        record_stream(
+            dir.path(),
+            &[
+                Message::new(0, ts("2026-01-01T10:00:00Z"), SampleEvent::Tick),
+                Message::new(1, ts("2026-01-01T10:05:00Z"), SampleEvent::Tick),
+            ],
+        );
+        assert_eq!(part_paths(dir.path()).expect("parts").len(), 1);
+
+        let (start, end) = session_time_bounds(dir.path())
+            .expect("bounds")
+            .expect("non-empty");
+        assert_eq!(start, ts("2026-01-01T10:00:00Z"));
+        assert_eq!(end, ts("2026-01-01T10:05:00Z"));
+    }
+
+    /// The column-scan fallback (a part with no statistics) yields the same
+    /// bounds as the statistics path. We write a part with statistics disabled
+    /// and confirm the scan still finds the right min/max.
+    #[test]
+    fn session_time_bounds_falls_back_to_scan_without_stats() {
+        use crate::message::Payload;
+        use crate::test_support::{ts, SampleEvent};
+        use arrow::array::{
+            ArrayRef, BinaryArray, StringArray, TimestampMicrosecondArray, UInt64Array,
+        };
+        use arrow::record_batch::RecordBatch;
+        use parquet::file::properties::EnabledStatistics;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let times = ["2026-01-01T10:00:00Z", "2026-01-01T10:09:00Z"];
+        let seq: ArrayRef = Arc::new(UInt64Array::from(vec![0u64, 1u64]));
+        let timestamp: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(
+                times
+                    .iter()
+                    .map(|t| ts(t).timestamp_micros())
+                    .collect::<Vec<_>>(),
+            )
+            .with_timezone("UTC"),
+        );
+        let type_name: ArrayRef =
+            Arc::new(StringArray::from(vec![SampleEvent::Tick.type_name(); 2]));
+        let blob = crate::encode_payload(&SampleEvent::Tick).expect("encode");
+        let payload: ArrayRef = Arc::new(BinaryArray::from(vec![blob.as_slice(); 2]));
+        let batch = RecordBatch::try_new(part_schema(), vec![seq, timestamp, type_name, payload])
+            .expect("batch");
+
+        let path = dir.path().join("20260101T100000Z.parquet");
+        let file = std::fs::File::create(&path).expect("create");
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, part_schema(), Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        // Confirm there really are no usable statistics, so the scan path runs.
+        let meta_file = std::fs::File::open(&path).expect("open");
+        let meta = ParquetRecordBatchReaderBuilder::try_new(meta_file)
+            .expect("builder")
+            .metadata()
+            .clone();
+        assert!(
+            stats_time_bounds(&meta).expect("stats").is_none(),
+            "statistics should be disabled so the scan fallback is exercised"
+        );
+
+        let (start, end) = session_time_bounds(dir.path())
+            .expect("bounds")
+            .expect("non-empty");
+        assert_eq!(start, ts("2026-01-01T10:00:00Z"));
+        assert_eq!(end, ts("2026-01-01T10:09:00Z"));
     }
 }

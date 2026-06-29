@@ -15,7 +15,6 @@ otelma = { path = "../otelma" }
 otelma-polymarket = { path = "../otelma-polymarket" }
 eframe = "0.35"
 egui = "0.35"
-egui_plot = "0.36"
 chrono = "0.4"
 rust_decimal = "1.42"
 clap = { version = "4.6", features = ["derive"] }

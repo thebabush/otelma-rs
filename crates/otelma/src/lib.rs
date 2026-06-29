@@ -26,7 +26,9 @@ pub use clock::{classify_backstep, Backstep};
 pub use codec::{decode_payload, encode_payload};
 pub use error::Error;
 pub use message::{Message, Payload};
-pub use parts::{compact_session, default_session_dir, part_paths, part_schema};
+pub use parts::{
+    compact_session, default_session_dir, part_paths, part_schema, session_time_bounds,
+};
 pub use reader::SessionReader;
 pub use recorder::Recorder;
 pub use replay::{drive, drive_realtime, PlaybackControl, Sink};

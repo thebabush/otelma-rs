@@ -9,8 +9,10 @@
 //! [`eframe::App::ui`] (a root [`egui::Ui`] with no margin), inside which we lay
 //! out panels via `Panel::show(ui, …)`.
 
+use std::path::Path;
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use eframe::egui::{self, Color32, RichText};
 
 use otelma_polymarket::AssetId;
@@ -87,6 +89,12 @@ impl Source {
 pub struct ReplayApp {
     source: Source,
     selected_asset: Option<AssetId>,
+    /// Live search-box text filtering the market sidebar.
+    search_query: String,
+    /// REPLAY session `[start, end]` bounds for the scrubber, read once from the
+    /// recording (cheap Parquet stats). `None` in LIVE (no fixed end) or if the
+    /// recording can't be probed.
+    bounds: Option<(DateTime<Utc>, DateTime<Utc>)>,
     /// Which body view is shown.
     view: ViewMode,
     /// Displayed timezone for every timestamp (source is UTC; default LOCAL).
@@ -106,22 +114,29 @@ impl ReplayApp {
     pub fn new(feeder: Feeder) -> Self {
         let speed = feeder.control.speed();
         let fast = !speed.is_finite();
-        Self::with_source(Source::Replay {
-            last_finite_speed: if fast { 1.0 } else { speed },
-            fast,
-            feeder,
-        })
+        // Probe the recording's time span once for the scrubber (cheap stats).
+        let bounds = session_bounds(&feeder.session_dir);
+        Self::with_source(
+            Source::Replay {
+                last_finite_speed: if fast { 1.0 } else { speed },
+                fast,
+                feeder,
+            },
+            bounds,
+        )
     }
 
     /// Build the app over a started [`LiveFeeder`] (live capture + monitor).
     pub fn new_live(feeder: LiveFeeder) -> Self {
-        Self::with_source(Source::Live { feeder })
+        Self::with_source(Source::Live { feeder }, None)
     }
 
-    fn with_source(source: Source) -> Self {
+    fn with_source(source: Source, bounds: Option<(DateTime<Utc>, DateTime<Utc>)>) -> Self {
         Self {
             source,
             selected_asset: None,
+            search_query: String::new(),
+            bounds,
             view: ViewMode::Chart,
             tz: Timezone::Local,
             y_scale: YScale::Auto,
@@ -410,14 +425,47 @@ impl ReplayApp {
         }
     }
 
-    /// CHART body: the bespoke painter chart (center) flanked by the placeholder
-    /// selector (left) and depth grid (right) — those two are replaced in 2b.
+    /// CHART body: the market sidebar (left, 228px), the order-book ladder
+    /// (right, 256px), and the center column (chart + volume + scrubber).
     fn chart_body_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
-        egui::Panel::right("depth")
+        let accent = theme::accent_for(self.source.mode());
+
+        // Default the selection to the first known asset once data arrives.
+        if self.selected_asset.is_none() {
+            self.selected_asset = state.asset_ids().first().cloned();
+        }
+
+        // Left market sidebar.
+        egui::Panel::left("market_sidebar")
+            .exact_size(ui::SIDEBAR_W)
             .frame(egui::Frame::default().fill(theme::BG_WINDOW))
             .show(ui, |ui| {
-                self.depth_ui(ui, state);
+                let groups = state.market_groups(&self.search_query);
+                if let Some(clicked) = ui::market_sidebar(
+                    ui,
+                    accent,
+                    &mut self.search_query,
+                    &groups,
+                    self.selected_asset.as_ref(),
+                ) {
+                    self.selected_asset = Some(clicked);
+                }
             });
+
+        // Right order-book ladder.
+        let book_asset = self
+            .selected_asset
+            .as_ref()
+            .and_then(|id| state.assets.get(id))
+            .cloned();
+        egui::Panel::right("order_book")
+            .exact_size(ui::ORDER_BOOK_W)
+            .frame(egui::Frame::default().fill(theme::BG_WINDOW))
+            .show(ui, |ui| {
+                ui::order_book(ui, book_asset.as_ref());
+            });
+
+        // Center column.
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(theme::BG_WINDOW))
             .show(ui, |ui| {
@@ -425,16 +473,12 @@ impl ReplayApp {
             });
     }
 
-    /// The CHART view's center column: header (top), volume sub-panel (bottom),
-    /// price chart (fills). The selector remains a temporary inline strip until
-    /// 2b adds the real market sidebar.
+    /// The CHART view's center column: header (top), scrubber (bottom), volume
+    /// sub-panel (above the scrubber), price chart (fills).
     fn center_column_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
         let mode = self.source.mode();
         let accent = theme::accent_for(mode);
         let series_mode = self.source.series_mode();
-
-        // Temporary asset selector (the real sidebar lands in 2b).
-        self.asset_selector_ui(ui, state);
 
         let asset = self
             .selected_asset
@@ -457,6 +501,23 @@ impl ReplayApp {
             .show(ui, |ui| {
                 self.y_scale = ui::chart_header(ui, accent, &title, asset, self.y_scale);
             });
+
+        // Scrubber / timeline (48px, bottom). A drag returns a seek target.
+        let mut seek_target = None;
+        egui::Panel::bottom("scrubber")
+            .exact_size(ui::SCRUBBER_H)
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::BG_WINDOW)
+                    .inner_margin(egui::Margin::ZERO),
+            )
+            .show(ui, |ui| {
+                seek_target =
+                    ui::scrubber(ui, accent, mode, self.tz, self.bounds, state.current_ts);
+            });
+        if let (Some(target), Source::Replay { feeder, .. }) = (seek_target, &mut self.source) {
+            feeder.seek_to(target);
+        }
 
         let current_t = current_t_secs(state);
 
@@ -496,64 +557,6 @@ impl ReplayApp {
             );
         });
     }
-
-    fn asset_selector_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
-        let assets = state.asset_ids();
-        if assets.is_empty() {
-            ui.label(
-                RichText::new("waiting for data…")
-                    .size(11.0)
-                    .color(theme::TEXT_DIMMER),
-            );
-            return;
-        }
-        if self.selected_asset.is_none() {
-            self.selected_asset = assets.first().cloned();
-        }
-        ui.horizontal(|ui| {
-            for asset in &assets {
-                let selected = self.selected_asset.as_ref() == Some(asset);
-                if ui
-                    .selectable_label(selected, state.label_for(asset))
-                    .clicked()
-                {
-                    self.selected_asset = Some(asset.clone());
-                }
-            }
-        });
-    }
-
-    fn depth_ui(&self, ui: &mut egui::Ui, state: &ReplayState) {
-        ui.label(
-            RichText::new("ORDER BOOK")
-                .size(9.5)
-                .color(theme::TEXT_FAINT),
-        );
-        let Some(asset) = self.selected_asset.as_ref() else {
-            return;
-        };
-        let Some(a) = state.assets.get(asset) else {
-            return;
-        };
-        egui::Grid::new("depth_grid").striped(true).show(ui, |ui| {
-            ui.label("side");
-            ui.label("price");
-            ui.label("size");
-            ui.end_row();
-            for (price, size) in a.depth_asks.iter().rev() {
-                ui.colored_label(theme::RED, "ask");
-                ui.label(format!("{price:.3}"));
-                ui.label(format!("{size:.0}"));
-                ui.end_row();
-            }
-            for (price, size) in &a.depth_bids {
-                ui.colored_label(theme::GREEN, "bid");
-                ui.label(format!("{price:.3}"));
-                ui.label(format!("{size:.0}"));
-                ui.end_row();
-            }
-        });
-    }
 }
 
 /// The playhead time in seconds since the session start: the latest applied
@@ -564,6 +567,23 @@ fn current_t_secs(state: &ReplayState) -> Option<f64> {
     let start = state.start_ts?;
     let now = state.current_ts?;
     Some((now - start).num_milliseconds() as f64 / 1000.0)
+}
+
+/// Probe a recording's `[start, end]` span for the scrubber via the engine's
+/// cheap [`otelma::session_time_bounds`]. A probe failure (unreadable dir) is
+/// logged and treated as "no bounds" — the scrubber still renders, just without
+/// seek/end-clock.
+fn session_bounds(session_dir: &Path) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    match otelma::session_time_bounds(session_dir) {
+        Ok(bounds) => bounds,
+        Err(e) => {
+            eprintln!(
+                "replay: could not read time bounds of {}: {e}",
+                session_dir.display()
+            );
+            None
+        }
+    }
 }
 
 impl eframe::App for ReplayApp {

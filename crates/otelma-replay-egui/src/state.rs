@@ -155,6 +155,97 @@ impl ReplayState {
     pub fn clear(&mut self) {
         *self = ReplayState::default();
     }
+
+    /// Build the deterministic, grouped market list for the left sidebar.
+    ///
+    /// Rows are derived purely from the recorded assets and their labels — this
+    /// is view-model math, egui-free and unit-tested. Each row's `price` is the
+    /// asset's current mid (its last [`BookPoint`]'s mid), or `None` before any
+    /// top-of-book. Grouping key is the **event title** parsed from the label
+    /// (the segment before the first `·`), falling back to the whole label when a
+    /// label has no separator (or the raw id when unlabeled). Groups are sorted
+    /// by title; rows within a group are sorted by their row label, then asset id
+    /// — both deterministic. Iteration over `assets`/`labels` is over `BTreeMap`s,
+    /// so the input order is itself deterministic.
+    ///
+    /// `filter` is an optional case-insensitive substring applied over the group
+    /// title and the row label (see [`row_matches`]); empty groups are dropped.
+    pub fn market_groups(&self, filter: &str) -> Vec<MarketGroup> {
+        let needle = filter.trim().to_lowercase();
+        // Gather rows per group in a BTreeMap so groups come out title-sorted.
+        let mut groups: BTreeMap<String, Vec<MarketRow>> = BTreeMap::new();
+        // List every known asset: those with data (`assets`) and those only named
+        // by a Market label (`labels`). A `BTreeSet` keeps the union sorted and
+        // deduped deterministically.
+        let known: std::collections::BTreeSet<&AssetId> =
+            self.assets.keys().chain(self.labels.keys()).collect();
+        for asset in known {
+            let label = self.label_for(asset);
+            let (group, row_label) = split_label(&label);
+            if !needle.is_empty() && !row_matches(&needle, &group, &row_label) {
+                continue;
+            }
+            let price = self
+                .assets
+                .get(asset)
+                .and_then(AssetState::last_book)
+                .map(|b| b.mid);
+            groups.entry(group).or_default().push(MarketRow {
+                asset_id: asset.clone(),
+                row_label,
+                price,
+            });
+        }
+        groups
+            .into_iter()
+            .map(|(title, mut rows)| {
+                // Deterministic row order: by label then asset id.
+                rows.sort_by(|a, b| {
+                    a.row_label
+                        .cmp(&b.row_label)
+                        .then_with(|| a.asset_id.cmp(&b.asset_id))
+                });
+                MarketGroup { title, rows }
+            })
+            .collect()
+    }
+}
+
+/// One row in the left market sidebar: an outcome and its current mid price.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarketRow {
+    /// The asset this row selects when clicked.
+    pub asset_id: AssetId,
+    /// The outcome label shown on the left (the label minus its event prefix).
+    pub row_label: String,
+    /// The asset's current mid, or `None` before any top-of-book.
+    pub price: Option<f64>,
+}
+
+/// A titled group of [`MarketRow`]s (one event), for the sidebar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarketGroup {
+    /// The group header (the event title).
+    pub title: String,
+    /// The rows in this group, in deterministic order.
+    pub rows: Vec<MarketRow>,
+}
+
+/// Split a full asset label into `(group_title, row_label)`. Labels are
+/// `"Event · Outcome · Side"` (or `"Outcome · Side"` when unlabeled); the group
+/// is the first segment and the row is the remainder. A label with no separator
+/// groups under itself.
+fn split_label(label: &str) -> (String, String) {
+    match label.split_once(" · ") {
+        Some((group, rest)) => (group.to_string(), rest.to_string()),
+        None => (label.to_string(), label.to_string()),
+    }
+}
+
+/// Whether a row matches a (pre-lowercased, non-empty) filter needle: a
+/// case-insensitive substring of either the group title or the row label.
+fn row_matches(needle: &str, group: &str, row_label: &str) -> bool {
+    group.to_lowercase().contains(needle) || row_label.to_lowercase().contains(needle)
 }
 
 /// Top-of-book as `(best_bid, best_ask)` f64s for plotting, or `None` if either
@@ -484,6 +575,124 @@ mod tests {
                 side: None,
             }),
         )
+    }
+
+    #[test]
+    fn market_groups_groups_by_event_with_price_and_order() {
+        use otelma_polymarket::testing::{market_meta, market_meta_msg};
+        let mut state = ReplayState::default();
+        {
+            let mut sink = GuiSink::new(&mut state);
+            // Two markets in "World Cup", one in "US Election".
+            sink.apply(&market_meta_msg(
+                0,
+                0,
+                market_meta("Netherlands", "yes-nl", "no-nl", Some("World Cup")),
+            ));
+            sink.apply(&market_meta_msg(
+                1,
+                0,
+                market_meta("Argentina", "yes-arg", "no-arg", Some("World Cup")),
+            ));
+            sink.apply(&market_meta_msg(
+                2,
+                0,
+                market_meta("Smith", "yes-smith", "no-smith", Some("US Election")),
+            ));
+            // Give yes-nl a top-of-book so it has a price; leave others priceless.
+            sink.apply(&book_msg(
+                3,
+                1,
+                "yes-nl",
+                vec![lvl(dec!(0.40), dec!(1))],
+                vec![lvl(dec!(0.42), dec!(1))],
+            ));
+        }
+
+        let groups = state.market_groups("");
+        // Groups sorted by title: "US Election" before "World Cup".
+        let titles: Vec<&str> = groups.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(titles, vec!["US Election", "World Cup"]);
+
+        // World Cup rows: Argentina (No, Yes) then Netherlands (No, Yes), sorted
+        // by row label.
+        let wc = &groups[1];
+        let labels: Vec<&str> = wc.rows.iter().map(|r| r.row_label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Argentina · No",
+                "Argentina · Yes",
+                "Netherlands · No",
+                "Netherlands · Yes",
+            ]
+        );
+        // Only yes-nl has a price.
+        let yes_nl = wc
+            .rows
+            .iter()
+            .find(|r| r.asset_id == AssetId::from("yes-nl"))
+            .expect("yes-nl row");
+        assert!((yes_nl.price.expect("priced") - 0.41).abs() < 1e-9);
+        let no_nl = wc
+            .rows
+            .iter()
+            .find(|r| r.asset_id == AssetId::from("no-nl"))
+            .expect("no-nl row");
+        assert_eq!(no_nl.price, None);
+    }
+
+    #[test]
+    fn market_groups_filter_is_case_insensitive_substring() {
+        use otelma_polymarket::testing::{market_meta, market_meta_msg};
+        let mut state = ReplayState::default();
+        {
+            let mut sink = GuiSink::new(&mut state);
+            sink.apply(&market_meta_msg(
+                0,
+                0,
+                market_meta("Netherlands", "yes-nl", "no-nl", Some("World Cup")),
+            ));
+            sink.apply(&market_meta_msg(
+                1,
+                0,
+                market_meta("Smith", "yes-smith", "no-smith", Some("US Election")),
+            ));
+        }
+        // Filter on the outcome name (case-insensitive).
+        let groups = state.market_groups("nether");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].title, "World Cup");
+        assert_eq!(groups[0].rows.len(), 2);
+
+        // Filter on the group/event title matches the whole group.
+        let by_event = state.market_groups("ELECTION");
+        assert_eq!(by_event.len(), 1);
+        assert_eq!(by_event[0].title, "US Election");
+
+        // A non-matching filter drops every group.
+        assert!(state.market_groups("zzz").is_empty());
+    }
+
+    #[test]
+    fn market_groups_unlabeled_asset_groups_under_its_id() {
+        let mut state = ReplayState::default();
+        {
+            let mut sink = GuiSink::new(&mut state);
+            // No Market meta → the label falls back to the raw id.
+            sink.apply(&book_msg(
+                0,
+                0,
+                "raw-token",
+                vec![lvl(dec!(0.5), dec!(1))],
+                vec![lvl(dec!(0.6), dec!(1))],
+            ));
+        }
+        let groups = state.market_groups("");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].title, "raw-token");
+        assert_eq!(groups[0].rows[0].row_label, "raw-token");
+        assert_eq!(groups[0].rows[0].price, Some(0.55));
     }
 
     #[test]
