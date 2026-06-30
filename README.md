@@ -11,11 +11,10 @@ strategy and analysis code can be developed and debugged against real recorded
 order-book/trade streams, fast-forwarded, paused, and re-run to identical state
 forever.
 
-![otelma replayer](docs/replayer.png)
+![otelma replayer — chart view](docs/replayer.png)
 
-> The screenshot above is produced by replaying a real recording —
-> `cargo run -p otelma-replay-egui <SESSION_DIR>` — and capturing the window.
-> The image is not committed; drop a PNG at `docs/replayer.png` to populate it.
+> The desktop replayer's **chart** view, replaying a real recording. See
+> [GUI](#gui) below for the live-updating **chain** grid and how to run it.
 
 ## Quickstart
 
@@ -71,8 +70,20 @@ deterministic and the recording is self-contained.
 `record` places no orders and is read-only against the venue; it only subscribes
 to market data.
 
-To watch a recording with live plots and a timeline scrubber, run the desktop
-replayer against a real session directory:
+## GUI
+
+`otelma-replay-egui` is a desktop replayer (eframe + `egui_plot`) for watching a
+recording with live plots and a timeline scrubber. It is a non-default workspace
+member, so its heavy GUI deps never enter the core/CLI build. It has two views:
+
+- **Chart** — a single market's mid/spread over time with the live order book and
+  a volume histogram (the [screenshot above](#otelma)).
+- **Chain** — every outcome in the event as a dense YES/NO grid (last, volume,
+  change, spread, top-of-book), cells flashing green/red as quotes move:
+
+![otelma replayer — chain grid replaying live](docs/replayer-chain.gif)
+
+Run it against a real session directory:
 
 ```bash
 # Record a session (see above), then replay it in the GUI.
