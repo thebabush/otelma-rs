@@ -461,10 +461,11 @@ impl ReplayApp {
     fn chart_body_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
         let accent = theme::accent_for(self.source.mode());
 
-        // Default the selection to the first known asset once data arrives.
-        if self.selected_asset.is_none() {
-            self.selected_asset = state.asset_ids().first().cloned();
-        }
+        // Resolve the selection: default to the first asset before any pick, and
+        // recover if the current selection has dangled (gone from the stream after
+        // a restart/seek, or never reappeared) so the chart never renders empty
+        // with no way back.
+        self.selected_asset = state.resolve_selection(self.selected_asset.as_ref());
 
         // Left market sidebar.
         egui::Panel::left("market_sidebar")
@@ -675,8 +676,12 @@ impl eframe::App for ReplayApp {
         if ctx.memory(|m| m.focused().is_none()) {
             let (mut toggle, mut restart, mut step) = (false, false, 0i64);
             ctx.input(|i| {
-                toggle = i.key_pressed(egui::Key::Space);
-                restart = i.key_pressed(egui::Key::R);
+                // Gate the plain shortcuts on no modifiers so OS chords like
+                // Cmd+R / Ctrl+R (reload) don't trigger restart, and a modified
+                // Space doesn't toggle playback.
+                let plain = !i.modifiers.any();
+                toggle = plain && i.key_pressed(egui::Key::Space);
+                restart = plain && i.key_pressed(egui::Key::R);
                 if i.key_pressed(egui::Key::ArrowRight) {
                     step += 1;
                 }

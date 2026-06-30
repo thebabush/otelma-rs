@@ -159,23 +159,8 @@ impl Feeder {
             .lock()
             .map(|s| (s.current_seq, s.current_ts))
             .unwrap_or((None, None));
-        self.stop_and_join();
-        self.refresh_control();
-        if from_ts.is_some_and(|t| target > t) {
-            // Forward: keep the chart and fast-forward (un-paced) from the
-            // playhead to the target — instant and exact.
-            self.spawn(Some(Seek::Forward {
-                from_seq: from_seq.unwrap_or(0),
-                stop: StopAt::Ts(target),
-            }));
-        } else {
-            if let Ok(mut s) = self.state.lock() {
-                s.clear();
-            }
-            self.spawn(Some(Seek::Rebuild {
-                stop: StopAt::Ts(target),
-            }));
-        }
+        let forward = from_ts.is_some_and(|t| target > t);
+        self.run_seek(from_seq.unwrap_or(0), forward, StopAt::Ts(target));
     }
 
     /// Step the playhead by `delta` messages (e.g. +1 / −1 for →/←) and pause.
@@ -187,21 +172,27 @@ impl Feeder {
             return;
         };
         let target = cur.saturating_add_signed(delta);
+        // Stepping always lands paused: pause now so `run_seek`'s `refresh_control`
+        // carries the paused state onto the fresh control before it spawns.
+        self.control.pause();
+        self.run_seek(cur, target > cur, StopAt::Seq(target));
+    }
+
+    /// The shared seek/step flow: stop the current thread, refresh the control
+    /// (carrying over speed + pause), then spawn an un-paced pre-roll to `stop`.
+    /// A **forward** seek keeps the chart and skips messages already applied
+    /// (`seq <= from_seq`); a **backward** seek clears the state and rebuilds
+    /// `[0, stop]`. `seek_to`/`step` decide only the direction and the `stop`.
+    fn run_seek(&mut self, from_seq: u64, forward: bool, stop: StopAt) {
         self.stop_and_join();
         self.refresh_control();
-        self.control.pause(); // stepping always lands paused
-        if target > cur {
-            self.spawn(Some(Seek::Forward {
-                from_seq: cur,
-                stop: StopAt::Seq(target),
-            }));
+        if forward {
+            self.spawn(Some(Seek::Forward { from_seq, stop }));
         } else {
             if let Ok(mut s) = self.state.lock() {
                 s.clear();
             }
-            self.spawn(Some(Seek::Rebuild {
-                stop: StopAt::Seq(target),
-            }));
+            self.spawn(Some(Seek::Rebuild { stop }));
         }
     }
 

@@ -8,11 +8,11 @@
 //! the render layer (`app.rs`). The view-model (`state.rs`) stays egui-free; the
 //! egui types live here and in `app.rs` only.
 //!
-//! The palette below intentionally defines the *complete* set of spec tokens
-//! up front (so later deliverables — the bespoke chart painter, order-book
-//! ladder, and CHAIN grid — draw from named tokens rather than re-deriving hex
-//! literals). Tokens not yet referenced are therefore expected.
-#![allow(dead_code)]
+//! The palette below defines the spec tokens the views draw from (so the chart
+//! painter, order-book ladder, and CHAIN grid name colours rather than
+//! re-deriving hex literals). Every token is referenced; a *new* unreferenced
+//! one will trip the dead-code lint (no file-wide `allow` hides it). A token
+//! kept as deliberately reserved should carry its own `#[allow(dead_code)]`.
 
 use chrono::{DateTime, Local, Utc};
 use eframe::egui::{Color32, FontData, FontDefinitions, FontFamily};
@@ -76,8 +76,6 @@ pub const BG_TOOLBAR: Color32 = Color32::from_rgb(0x0c, 0x0e, 0x12);
 pub const BG_INPUT: Color32 = Color32::from_rgb(0x10, 0x13, 0x19);
 /// Control-button background `#1c1f26`.
 pub const BG_CONTROL: Color32 = Color32::from_rgb(0x1c, 0x1f, 0x26);
-/// Chain "off" checkbox background `#14171c`.
-pub const BG_CHECK_OFF: Color32 = Color32::from_rgb(0x14, 0x17, 0x1c);
 
 // ── Border tokens ────────────────────────────────────────────────────────────
 
@@ -85,20 +83,8 @@ pub const BG_CHECK_OFF: Color32 = Color32::from_rgb(0x14, 0x17, 0x1c);
 pub const BORDER_SEAM: Color32 = Color32::from_rgb(0x18, 0x1b, 0x21);
 /// Stronger border `#20242c`.
 pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x20, 0x24, 0x2c);
-/// Chain cell-grid border `#1c2128`.
-pub const BORDER_CELL: Color32 = Color32::from_rgb(0x1c, 0x21, 0x28);
 /// Chain center seam / section accents `#2a2f38`.
 pub const BORDER_SEAM_STRONG: Color32 = Color32::from_rgb(0x2a, 0x2f, 0x38);
-/// Chain row underline `#14171c`.
-pub const BORDER_ROW: Color32 = Color32::from_rgb(0x14, 0x17, 0x1c);
-/// Toolbar control border (lighter) `#232830`.
-pub const BORDER_CTRL: Color32 = Color32::from_rgb(0x23, 0x28, 0x30);
-/// Toolbar control border (stronger) `#2b3039`.
-pub const BORDER_CTRL_STRONG: Color32 = Color32::from_rgb(0x2b, 0x30, 0x39);
-/// Title decorative dots `#34373d`.
-pub const DOT: Color32 = Color32::from_rgb(0x34, 0x37, 0x3d);
-/// TZ-toggle dotted underline `#3a4150`.
-pub const UNDERLINE: Color32 = Color32::from_rgb(0x3a, 0x41, 0x50);
 
 // ── Text tokens ──────────────────────────────────────────────────────────────
 
@@ -152,15 +138,22 @@ const FUCHSIA_INK: Color32 = Color32::from_rgb(0x16, 0x04, 0x18);
 const CYAN: Color32 = Color32::from_rgb(0x22, 0xd3, 0xee);
 const CYAN_INK: Color32 = Color32::from_rgb(0x03, 0x16, 0x1c);
 
-/// Pre-blend `fg` at opacity `alpha` over [`BG_WINDOW`] (opaque result), so a
-/// CSS `rgba(accent, alpha)` wash renders as a flat token.
-const fn blend_over_window(fg: Color32, alpha: u8) -> Color32 {
+/// Pre-blend `fg` at `alpha`/255 over `bg` (opaque result), so a CSS
+/// `rgba(fg, alpha)` wash renders as a flat token. The single alpha-mix helper
+/// for the whole replayer (the render layer's washes delegate to it).
+pub const fn blend_over(fg: Color32, bg: Color32, alpha: u8) -> Color32 {
     let a = alpha as u16;
     let inv = 255 - a;
-    let r = (fg.r() as u16 * a + BG_WINDOW.r() as u16 * inv) / 255;
-    let g = (fg.g() as u16 * a + BG_WINDOW.g() as u16 * inv) / 255;
-    let b = (fg.b() as u16 * a + BG_WINDOW.b() as u16 * inv) / 255;
+    let r = (fg.r() as u16 * a + bg.r() as u16 * inv) / 255;
+    let g = (fg.g() as u16 * a + bg.g() as u16 * inv) / 255;
+    let b = (fg.b() as u16 * a + bg.b() as u16 * inv) / 255;
     Color32::from_rgb(r as u8, g as u8, b as u8)
+}
+
+/// Pre-blend `fg` at opacity `alpha` over [`BG_WINDOW`]; a thin wrapper over the
+/// general [`blend_over`] for the common "wash over the window background" case.
+const fn blend_over_window(fg: Color32, alpha: u8) -> Color32 {
+    blend_over(fg, BG_WINDOW, alpha)
 }
 
 /// The accent palette for `mode`. REPLAY → fuchsia, LIVE → cyan. This is the

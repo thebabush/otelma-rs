@@ -6,6 +6,8 @@
 //! windows, and extrema — it never does the math itself. Everything is
 //! unit-tested in isolation.
 
+use chrono::{DateTime, Duration, Utc};
+
 use crate::state::{BookPoint, VolumePoint};
 
 /// Trailing window (seconds of *message* time) kept for the live series and used
@@ -146,6 +148,31 @@ pub fn format_volume(v: f64) -> String {
     } else {
         format!("{v:.0}")
     }
+}
+
+/// The scrubber playhead position as a fraction `0..=1` of the session span
+/// `[start, end]` at recorded time `now`. A non-positive span (single instant)
+/// maps to `0.0`; the result is clamped to `[0, 1]`. Pure recorded-time math
+/// (never a wall-clock read), so it stays on the determinism-friendly side; the
+/// renderer only turns the fraction into pixels.
+pub fn playhead_frac(bounds: (DateTime<Utc>, DateTime<Utc>), now: DateTime<Utc>) -> f64 {
+    let (start, end) = bounds;
+    let span = (end - start).num_milliseconds() as f64;
+    if span <= 0.0 {
+        0.0
+    } else {
+        ((now - start).num_milliseconds() as f64 / span).clamp(0.0, 1.0)
+    }
+}
+
+/// The inverse of [`playhead_frac`]: the recorded time at fraction `frac` of the
+/// session span `[start, end]`. `frac` is clamped to `[0, 1]`. Used to map a
+/// scrubber position (or cursor x, once the renderer has divided it by the track
+/// width) back to the time a seek would land on.
+pub fn time_at_frac(bounds: (DateTime<Utc>, DateTime<Utc>), frac: f64) -> DateTime<Utc> {
+    let (start, end) = bounds;
+    let span_ms = (end - start).num_milliseconds() as f64;
+    start + Duration::milliseconds((frac.clamp(0.0, 1.0) * span_ms) as i64)
 }
 
 /// Number of order-book levels shown per side in the ladder.
@@ -304,6 +331,41 @@ mod tests {
         let side = LadderSide::from_levels(&[]);
         assert!(side.levels.is_empty());
         assert_eq!(side.max_size, 0.0);
+    }
+
+    #[test]
+    fn playhead_frac_and_inverse_round_trip() {
+        use chrono::TimeZone;
+        let start = Utc.with_ymd_and_hms(2026, 6, 29, 10, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 29, 11, 0, 0).unwrap(); // +1h
+        let bounds = (start, end);
+
+        // Endpoints and the midpoint.
+        assert_eq!(playhead_frac(bounds, start), 0.0);
+        assert_eq!(playhead_frac(bounds, end), 1.0);
+        let mid = start + Duration::minutes(30);
+        assert!((playhead_frac(bounds, mid) - 0.5).abs() < 1e-9);
+
+        // Out-of-range times clamp.
+        assert_eq!(playhead_frac(bounds, start - Duration::minutes(5)), 0.0);
+        assert_eq!(playhead_frac(bounds, end + Duration::minutes(5)), 1.0);
+
+        // The inverse lands back on the original time (to ms granularity).
+        assert_eq!(time_at_frac(bounds, 0.0), start);
+        assert_eq!(time_at_frac(bounds, 1.0), end);
+        assert_eq!(time_at_frac(bounds, 0.5), mid);
+        // Fraction clamps too.
+        assert_eq!(time_at_frac(bounds, -1.0), start);
+        assert_eq!(time_at_frac(bounds, 2.0), end);
+    }
+
+    #[test]
+    fn playhead_frac_zero_span_is_zero() {
+        use chrono::TimeZone;
+        let t = Utc.with_ymd_and_hms(2026, 6, 29, 10, 0, 0).unwrap();
+        // A single-instant session (start == end) maps everything to 0.
+        assert_eq!(playhead_frac((t, t), t), 0.0);
+        assert_eq!(time_at_frac((t, t), 0.7), t);
     }
 
     #[test]

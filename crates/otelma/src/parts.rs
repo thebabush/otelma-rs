@@ -154,24 +154,17 @@ pub fn session_time_bounds(session_dir: impl AsRef<Path>) -> Result<Option<TimeB
     };
     let last = parts.last().expect("non-empty parts has a last");
 
-    let Some((start, _)) = part_time_bounds(first)? else {
+    // Read the first part's span once; its min is the session start, and its max
+    // is the fallback session end (single part, or a trailing empty last part).
+    let Some((start, first_end)) = part_time_bounds(first)? else {
         return Ok(None);
     };
-    // Single part: its own max is the session end; avoid re-reading it.
+    // The global max lives in the last part; fall back to the first part's max
+    // when the last part is empty or is the first part itself.
     let end = if parts.len() == 1 {
-        part_time_bounds(first)?
-            .expect("first part had a min, so it has a max")
-            .1
+        first_end
     } else {
-        match part_time_bounds(last)? {
-            Some((_, end)) => end,
-            // A trailing empty part: the end is the first part's max.
-            None => {
-                part_time_bounds(first)?
-                    .expect("first part had a min, so it has a max")
-                    .1
-            }
-        }
+        part_time_bounds(last)?.map_or(first_end, |(_, end)| end)
     };
     Ok(Some((start, end)))
 }

@@ -158,14 +158,28 @@ fn scale_toggle(ui: &mut egui::Ui, accent: Accent, scale: YScale) -> YScale {
 /// Shared X/Y → pixel mapping for one plot rect (already inset by the margins).
 struct PlotMap {
     inner: Rect,
-    x: Range,
+    /// The X (time → pixel) mapping, shared verbatim with the volume panel.
+    xmap: PlotXMap,
     y: Range,
 }
 
 impl PlotMap {
-    /// Map a `t_secs` to a pixel x within `inner`.
+    fn new(inner: Rect, x: Range, y: Range) -> Self {
+        Self {
+            inner,
+            xmap: PlotXMap {
+                inner_left: inner.left(),
+                inner_width: inner.width(),
+                x,
+            },
+            y,
+        }
+    }
+
+    /// Map a `t_secs` to a pixel x within `inner` (the same mapping the volume
+    /// panel uses, via the shared [`PlotXMap`]).
     fn px(&self, t: f64) -> f32 {
-        self.inner.left() + (self.x.norm(t) as f32) * self.inner.width()
+        self.xmap.px(t)
     }
 
     /// Map a value to a pixel y within `inner` (y grows downward → invert).
@@ -209,7 +223,7 @@ pub fn price_chart(
         .unwrap_or_default();
 
     let y = series::auto_y_range(scale, &visible);
-    let map = PlotMap { inner, x, y };
+    let map = PlotMap::new(inner, x, y);
 
     // Grid + Y tick labels (3 decimals), top row = y.max.
     for i in 0..Y_GRID_LINES {
@@ -299,30 +313,19 @@ pub fn price_chart(
         }
     }
 
-    // Dashed playhead at the current time.
-    if let Some(t) = current_t {
-        draw_dashed_v(painter, map.px(t), inner.top(), inner.bottom(), accent.dim);
-    }
+    // Dashed playhead + scrub-preview line, sharing the helper with the volume
+    // panel so both panels line up exactly.
+    draw_playhead_and_preview(
+        painter,
+        &map.xmap,
+        inner.top(),
+        inner.bottom(),
+        current_t,
+        preview_t,
+        accent,
+    );
 
-    // Scrub-preview line (solid accent) while dragging the scrubber — shows where
-    // a release would seek to, without moving the playhead.
-    if let Some(pt) = preview_t {
-        if pt >= x.min && pt <= x.max {
-            painter.line_segment(
-                [
-                    Pos2::new(map.px(pt), inner.top()),
-                    Pos2::new(map.px(pt), inner.bottom()),
-                ],
-                Stroke::new(1.5, accent.base),
-            );
-        }
-    }
-
-    PlotXMap {
-        inner_left: inner.left(),
-        inner_width: inner.width(),
-        x,
-    }
+    map.xmap
 }
 
 /// The shared X mapping handed to the volume panel so its bars line up with the
@@ -336,6 +339,36 @@ pub struct PlotXMap {
 impl PlotXMap {
     fn px(&self, t: f64) -> f32 {
         self.inner_left + (self.x.norm(t) as f32) * self.inner_width
+    }
+}
+
+/// Draw the dashed playhead line (at `current_t`, `accent.dim`) and the solid
+/// scrub-preview line (at `preview_t`, `accent.base`, only when inside the
+/// x-window) spanning `[top, bottom]`, using the shared X mapping `xmap`. Both
+/// the price chart and the volume panel call this so the two panels' vertical
+/// markers align exactly.
+fn draw_playhead_and_preview(
+    painter: &egui::Painter,
+    xmap: &PlotXMap,
+    top: f32,
+    bottom: f32,
+    current_t: Option<f64>,
+    preview_t: Option<f64>,
+    accent: Accent,
+) {
+    // Dashed playhead at the current time.
+    if let Some(t) = current_t {
+        draw_dashed_v(painter, xmap.px(t), top, bottom, accent.dim);
+    }
+    // Scrub-preview line (solid accent) while dragging the scrubber — shows where
+    // a release would seek to, without moving the playhead. Guarded to the window.
+    if let Some(pt) = preview_t {
+        if pt >= xmap.x.min && pt <= xmap.x.max {
+            painter.line_segment(
+                [Pos2::new(xmap.px(pt), top), Pos2::new(xmap.px(pt), bottom)],
+                Stroke::new(1.5, accent.base),
+            );
+        }
     }
 }
 
@@ -405,44 +438,20 @@ pub fn volume_panel(
         }
     }
 
-    // Same dashed playhead as the chart, so the two panels align.
-    if let Some(t) = current_t {
-        draw_dashed_v(painter, xmap.px(t), top_y, baseline_y, accent.dim);
-    }
-    // Scrub-preview line, aligned with the chart's.
-    if let Some(pt) = preview_t {
-        if pt >= xmap.x.min && pt <= xmap.x.max {
-            painter.line_segment(
-                [
-                    Pos2::new(xmap.px(pt), top_y),
-                    Pos2::new(xmap.px(pt), baseline_y),
-                ],
-                Stroke::new(1.5, accent.base),
-            );
-        }
-    }
+    // Same dashed playhead + scrub-preview as the chart, so the two panels align.
+    draw_playhead_and_preview(
+        painter, xmap, top_y, baseline_y, current_t, preview_t, accent,
+    );
 }
 
 /// Up bar: green at ~50% over the window bg (`rgba(46,194,126,.5)`).
-fn green_bar() -> Color32 {
-    blend_over(theme::GREEN, theme::BG_WINDOW, 128)
+const fn green_bar() -> Color32 {
+    theme::blend_over(theme::GREEN, theme::BG_WINDOW, 128)
 }
 
 /// Down bar: red at ~50% over the window bg (`rgba(229,72,77,.5)`).
-fn red_bar() -> Color32 {
-    blend_over(theme::RED, theme::BG_WINDOW, 128)
-}
-
-/// Pre-blend `fg` at `alpha`/255 over `bg` (opaque result).
-fn blend_over(fg: Color32, bg: Color32, alpha: u8) -> Color32 {
-    let a = alpha as u16;
-    let inv = 255 - a;
-    let mix = |f: u8, b: u8| ((f as u16 * a + b as u16 * inv) / 255) as u8;
-    Color32::from_rgb(
-        mix(fg.r(), bg.r()),
-        mix(fg.g(), bg.g()),
-        mix(fg.b(), bg.b()),
-    )
+const fn red_bar() -> Color32 {
+    theme::blend_over(theme::RED, theme::BG_WINDOW, 128)
 }
 
 /// A dashed vertical line (`[2,3]` dash) from `y0` to `y1` at `x`.
@@ -778,13 +787,13 @@ fn book_row(
 }
 
 /// Faint red ask depth bar (`rgba(229,72,77,.14)`), pre-blended over the window.
-fn ask_depth_bar() -> Color32 {
-    blend_over(theme::RED, theme::BG_WINDOW, 36)
+const fn ask_depth_bar() -> Color32 {
+    theme::blend_over(theme::RED, theme::BG_WINDOW, 36)
 }
 
 /// Faint green bid depth bar (`rgba(46,194,126,.14)`), pre-blended.
-fn bid_depth_bar() -> Color32 {
-    blend_over(theme::GREEN, theme::BG_WINDOW, 36)
+const fn bid_depth_bar() -> Color32 {
+    theme::blend_over(theme::GREEN, theme::BG_WINDOW, 36)
 }
 
 // ── Scrubber / timeline ──────────────────────────────────────────────────────
@@ -837,30 +846,24 @@ pub fn scrubber(
 
     let live = matches!(mode, Mode::Live);
 
-    // Playhead fraction within [start, end] (0..1). LIVE pins to the right.
+    // Playhead fraction within [start, end] (0..1). LIVE pins to the right. The
+    // time↔fraction math is the view-model's ([`series`]); here we only place it.
     let frac = if live {
         1.0
     } else {
         match (bounds, current_ts) {
-            (Some((start, end)), Some(now)) => {
-                let span = (end - start).num_milliseconds() as f64;
-                if span <= 0.0 {
-                    0.0
-                } else {
-                    ((now - start).num_milliseconds() as f64 / span).clamp(0.0, 1.0)
-                }
-            }
+            (Some(b), Some(now)) => series::playhead_frac(b, now) as f32,
             _ => 0.0,
         }
-    } as f32;
+    };
     let playhead_x = track_left + frac * track_w;
 
-    // Map a track x back to a recorded time.
+    // Map a track x back to a recorded time: pixel→fraction here, fraction→time
+    // in the view-model.
     let time_at = |x: f32| -> Option<DateTime<Utc>> {
-        let (start, end) = bounds?;
-        let f = ((x - track_left) / track_w).clamp(0.0, 1.0) as f64;
-        let span_ms = (end - start).num_milliseconds() as f64;
-        Some(start + Duration::milliseconds((f * span_ms) as i64))
+        let b = bounds?;
+        let f = ((x - track_left) / track_w) as f64;
+        Some(series::time_at_frac(b, f))
     };
 
     // Interaction (REPLAY only). A drag only previews (no seek until release); a
@@ -998,8 +1001,8 @@ const CHAIN_HANDLE_W: f32 = 7.0;
 pub const CHAIN_COL_MIN: f32 = 90.0;
 pub const CHAIN_COL_MAX: f32 = 340.0;
 /// Chain grid line — a faint translucent white so the rules read over BOTH the
-/// dark outcome column and the green/red quadrant tints (an opaque dark seam like
-/// `BORDER_CELL` vanishes against the tint).
+/// dark outcome column and the green/red quadrant tints (an opaque dark seam
+/// vanishes against the tint).
 const CHAIN_GRID: Color32 = Color32::from_rgba_premultiplied(22, 22, 22, 22);
 /// Zebra: a very mild white overlay applied to every other data row.
 const CHAIN_STRIPE: Color32 = Color32::from_rgba_premultiplied(8, 8, 8, 8);
@@ -1007,6 +1010,16 @@ const CHAIN_STRIPE: Color32 = Color32::from_rgba_premultiplied(8, 8, 8, 8);
 const CELL_PAD: f32 = 7.0;
 /// Row-flash decay duration (s) — a calm ~0.18s ease-out back to the tint.
 const FLASH_DECAY_SECS: f32 = 0.18;
+/// YES quadrant resting tint (green ~.13 over the window). Const so it isn't
+/// recomputed per row per frame.
+const YES_TINT: Color32 = theme::blend_over(theme::GREEN, theme::BG_WINDOW, 33);
+/// NO quadrant resting tint (red ~.12 over the window).
+const NO_TINT: Color32 = theme::blend_over(theme::RED, theme::BG_WINDOW, 31);
+/// Flash target for an up trade (green ~.34 over the window), eased back to the
+/// tint as the flash decays.
+const FLASH_UP: Color32 = theme::blend_over(theme::GREEN, theme::BG_WINDOW, 87);
+/// Flash target for a down trade (red ~.34 over the window).
+const FLASH_DOWN: Color32 = theme::blend_over(theme::RED, theme::BG_WINDOW, 87);
 
 /// One column in a YES (or NO) book block: its label and fixed pixel width.
 struct ChainCol {
@@ -1381,18 +1394,15 @@ fn chain_data_row(
     let painter = ui.painter();
 
     // YES / NO resting tints, blended with any active flash colour.
-    let yes_tint = blend_over(theme::GREEN, theme::BG_WINDOW, 33); // ~.13
-    let no_tint = blend_over(theme::RED, theme::BG_WINDOW, 31); // ~.12
     let (yes_bg, no_bg) = match flash_factor {
         Some((up, f)) => {
             // Flash target ~.34 alpha of the up/down colour, decaying to the tint.
-            let flash_col = if up { theme::GREEN } else { theme::RED };
-            let target = blend_over(flash_col, theme::BG_WINDOW, 87);
-            let a = lerp_color(yes_tint, target, f);
-            let b = lerp_color(no_tint, target, f);
+            let target = if up { FLASH_UP } else { FLASH_DOWN };
+            let a = lerp_color(YES_TINT, target, f);
+            let b = lerp_color(NO_TINT, target, f);
             (a, b)
         }
-        None => (yes_tint, no_tint),
+        None => (YES_TINT, NO_TINT),
     };
 
     // Paint the block backgrounds (the tint/flash quadrants).

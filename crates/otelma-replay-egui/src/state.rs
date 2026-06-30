@@ -145,9 +145,27 @@ pub struct ReplayState {
 }
 
 impl ReplayState {
-    /// Asset ids seen so far, in sorted order.
-    pub fn asset_ids(&self) -> Vec<AssetId> {
-        self.assets.keys().cloned().collect()
+    /// Resolve the asset that should be selected/charted given the caller's
+    /// current selection. Pure view-model logic so it's unit-testable:
+    ///
+    /// - No selection yet (`None`) → the first known asset (or `None` if empty).
+    /// - A selection that is still present in `assets` → kept as-is.
+    /// - A selection that has *dangled* (its id is no longer in `assets`, e.g.
+    ///   after a restart preserved the old selection or the asset never reappeared
+    ///   in the stream) → falls back to the first known asset, so the chart and
+    ///   order book recover instead of rendering empty. An empty state keeps the
+    ///   dangling selection (nothing better to pick).
+    pub fn resolve_selection(&self, current: Option<&AssetId>) -> Option<AssetId> {
+        match current {
+            Some(id) if self.assets.contains_key(id) => Some(id.clone()),
+            Some(id) => self
+                .assets
+                .keys()
+                .next()
+                .cloned()
+                .or_else(|| Some(id.clone())),
+            None => self.assets.keys().next().cloned(),
+        }
     }
 
     /// Human-readable label for `asset`, falling back to the raw token id when no
@@ -208,37 +226,35 @@ impl ReplayState {
     pub fn chain_view(&self, filter: &str) -> Vec<ChainGroup> {
         let needle = filter.trim().to_lowercase();
         let now_secs = self.current_t_secs();
-        // Gather rows per group title in a BTreeMap so groups come out sorted.
-        let mut groups: BTreeMap<String, Vec<ChainRow>> = BTreeMap::new();
         // Iterating the markets BTreeMap is itself deterministic.
-        for meta in self.markets.values() {
-            let title = chain_group_title(meta);
-            let outcome = meta.outcome_title.clone();
-            if !needle.is_empty() && !row_matches(&needle, &title, &outcome) {
-                continue;
-            }
-            let yes = self.side_stats(&meta.yes_asset_id, now_secs);
-            let no = self.side_stats(&meta.no_asset_id, now_secs);
-            groups.entry(title).or_default().push(ChainRow {
-                outcome,
-                yes_asset: meta.yes_asset_id.clone(),
-                no_asset: meta.no_asset_id.clone(),
-                yes,
-                no,
-            });
-        }
-        groups
-            .into_iter()
-            .map(|(title, mut rows)| {
-                // Deterministic row order: by outcome then yes asset id.
-                rows.sort_by(|a, b| {
-                    a.outcome
-                        .cmp(&b.outcome)
-                        .then_with(|| a.yes_asset.cmp(&b.yes_asset))
-                });
-                ChainGroup { title, rows }
-            })
-            .collect()
+        group_by_title(
+            self.markets.values(),
+            // Derive (group title, row), skipping on no filter match.
+            |meta| {
+                let title = chain_group_title(meta);
+                let outcome = meta.outcome_title.clone();
+                if !needle.is_empty() && !row_matches(&needle, &title, &outcome) {
+                    return None;
+                }
+                let row = ChainRow {
+                    outcome,
+                    yes_asset: meta.yes_asset_id.clone(),
+                    no_asset: meta.no_asset_id.clone(),
+                    yes: self.side_stats(&meta.yes_asset_id, now_secs),
+                    no: self.side_stats(&meta.no_asset_id, now_secs),
+                };
+                Some((title, row))
+            },
+            // Deterministic row order: by outcome then yes asset id.
+            |a, b| {
+                a.outcome
+                    .cmp(&b.outcome)
+                    .then_with(|| a.yes_asset.cmp(&b.yes_asset))
+            },
+        )
+        .into_iter()
+        .map(|(title, rows)| ChainGroup { title, rows })
+        .collect()
     }
 
     /// Build the deterministic, grouped market list for the left sidebar.
@@ -257,43 +273,72 @@ impl ReplayState {
     /// title and the row label (see [`row_matches`]); empty groups are dropped.
     pub fn market_groups(&self, filter: &str) -> Vec<MarketGroup> {
         let needle = filter.trim().to_lowercase();
-        // Gather rows per group in a BTreeMap so groups come out title-sorted.
-        let mut groups: BTreeMap<String, Vec<MarketRow>> = BTreeMap::new();
         // List every known asset: those with data (`assets`) and those only named
         // by a Market label (`labels`). A `BTreeSet` keeps the union sorted and
         // deduped deterministically.
         let known: std::collections::BTreeSet<&AssetId> =
             self.assets.keys().chain(self.labels.keys()).collect();
-        for asset in known {
-            let label = self.label_for(asset);
-            let (group, row_label) = split_label(&label);
-            if !needle.is_empty() && !row_matches(&needle, &group, &row_label) {
-                continue;
-            }
-            let price = self
-                .assets
-                .get(asset)
-                .and_then(AssetState::last_book)
-                .map(|b| b.mid);
-            groups.entry(group).or_default().push(MarketRow {
-                asset_id: asset.clone(),
-                row_label,
-                price,
-            });
-        }
-        groups
-            .into_iter()
-            .map(|(title, mut rows)| {
-                // Deterministic row order: by label then asset id.
-                rows.sort_by(|a, b| {
-                    a.row_label
-                        .cmp(&b.row_label)
-                        .then_with(|| a.asset_id.cmp(&b.asset_id))
-                });
-                MarketGroup { title, rows }
-            })
-            .collect()
+        group_by_title(
+            known,
+            // Derive (group title, row), skipping on no filter match.
+            |asset| {
+                let label = self.label_for(asset);
+                let (group, row_label) = split_label(&label);
+                if !needle.is_empty() && !row_matches(&needle, &group, &row_label) {
+                    return None;
+                }
+                let price = self
+                    .assets
+                    .get(asset)
+                    .and_then(AssetState::last_book)
+                    .map(|b| b.mid);
+                let row = MarketRow {
+                    asset_id: asset.clone(),
+                    row_label,
+                    price,
+                };
+                Some((group, row))
+            },
+            // Deterministic row order: by label then asset id.
+            |a, b| {
+                a.row_label
+                    .cmp(&b.row_label)
+                    .then_with(|| a.asset_id.cmp(&b.asset_id))
+            },
+        )
+        .into_iter()
+        .map(|(title, rows)| MarketGroup { title, rows })
+        .collect()
     }
+}
+
+/// The filter/group/sort skeleton shared by [`ReplayState::chain_view`] and
+/// [`ReplayState::market_groups`]. Iterates `source`, derives `(group title,
+/// row)` via `derive` (returning `None` skips an item — e.g. a filter miss),
+/// buckets rows into a `BTreeMap<String, _>` so groups come out title-sorted, and
+/// sorts each group's rows with `row_cmp`. Pure and deterministic: the `BTreeMap`
+/// keeps both the grouping and the group order stable.
+fn group_by_title<I, T, R>(
+    source: I,
+    mut derive: impl FnMut(T) -> Option<(String, R)>,
+    mut row_cmp: impl FnMut(&R, &R) -> std::cmp::Ordering,
+) -> Vec<(String, Vec<R>)>
+where
+    I: IntoIterator<Item = T>,
+{
+    let mut groups: BTreeMap<String, Vec<R>> = BTreeMap::new();
+    for item in source {
+        if let Some((title, row)) = derive(item) {
+            groups.entry(title).or_default().push(row);
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(title, mut rows)| {
+            rows.sort_by(&mut row_cmp);
+            (title, rows)
+        })
+        .collect()
 }
 
 /// One row in the left market sidebar: an outcome and its current mid price.
@@ -472,6 +517,21 @@ fn best_bid_ask(book: &BookUpdate) -> Option<(f64, f64)> {
     ))
 }
 
+/// Convert a book side's `Level`s into `(price, size)` f64 pairs as received
+/// (best-first), for the depth ladder. Shared by the bid and ask sides so the
+/// per-level conversion lives once.
+fn depth_levels(levels: &[otelma_polymarket::Level]) -> Vec<(f64, f64)> {
+    levels
+        .iter()
+        .map(|l| {
+            (
+                decimal_to_f64(l.price.value()),
+                decimal_to_f64(l.size.value()),
+            )
+        })
+        .collect()
+}
+
 /// Lossy conversion for plotting only (ImPlot/egui work in f64).
 fn decimal_to_f64(d: rust_decimal::Decimal) -> f64 {
     use rust_decimal::prelude::ToPrimitive;
@@ -572,26 +632,8 @@ impl Sink<PolyEvent> for GuiSink<'_> {
                         spread: best_ask - best_bid,
                     });
                 }
-                asset.depth_bids = book
-                    .bids
-                    .iter()
-                    .map(|l| {
-                        (
-                            decimal_to_f64(l.price.value()),
-                            decimal_to_f64(l.size.value()),
-                        )
-                    })
-                    .collect();
-                asset.depth_asks = book
-                    .asks
-                    .iter()
-                    .map(|l| {
-                        (
-                            decimal_to_f64(l.price.value()),
-                            decimal_to_f64(l.size.value()),
-                        )
-                    })
-                    .collect();
+                asset.depth_bids = depth_levels(&book.bids);
+                asset.depth_asks = depth_levels(&book.asks);
             }
             PolyEvent::Trade(trade) => {
                 let asset = self.state.assets.entry(trade.asset_id.clone()).or_default();
@@ -726,6 +768,44 @@ mod tests {
     }
 
     #[test]
+    fn resolve_selection_defaults_keeps_and_recovers() {
+        let mut state = ReplayState::default();
+        {
+            let mut sink = GuiSink::new(&mut state);
+            sink.apply(&book_msg(
+                0,
+                0,
+                "A",
+                vec![lvl(dec!(0.1), dec!(1))],
+                vec![lvl(dec!(0.2), dec!(1))],
+            ));
+            sink.apply(&book_msg(
+                1,
+                1,
+                "B",
+                vec![lvl(dec!(0.1), dec!(1))],
+                vec![lvl(dec!(0.2), dec!(1))],
+            ));
+        }
+        let a = AssetId::from("A");
+        let b = AssetId::from("B");
+
+        // No selection yet → first known asset (sorted ⇒ A).
+        assert_eq!(state.resolve_selection(None), Some(a.clone()));
+        // A present selection is kept as-is.
+        assert_eq!(state.resolve_selection(Some(&b)), Some(b.clone()));
+        // A dangling selection (not in `assets`) falls back to the first asset.
+        let gone = AssetId::from("gone");
+        assert_eq!(state.resolve_selection(Some(&gone)), Some(a));
+
+        // On empty state: no default, and a dangling selection is kept (nothing
+        // better to pick).
+        let empty = ReplayState::default();
+        assert_eq!(empty.resolve_selection(None), None);
+        assert_eq!(empty.resolve_selection(Some(&b)), Some(b));
+    }
+
+    #[test]
     fn market_meta_populates_label_map() {
         use otelma_polymarket::testing::{market_meta, market_meta_msg};
 
@@ -770,14 +850,12 @@ mod tests {
                 vec![lvl(dec!(0.2), dec!(1))],
             ));
         }
-        assert_eq!(
-            state.asset_ids(),
-            vec![AssetId::from("A"), AssetId::from("Z")]
-        );
+        let ids: Vec<AssetId> = state.assets.keys().cloned().collect();
+        assert_eq!(ids, vec![AssetId::from("A"), AssetId::from("Z")]);
 
         state.clear();
         assert_eq!(state, ReplayState::default());
-        assert!(state.asset_ids().is_empty());
+        assert!(state.assets.is_empty());
     }
 
     /// A `price_change` message for `asset` with a changed `size`.
