@@ -1435,6 +1435,16 @@ fn chain_data_row(
         Stroke::new(1.0, theme::BORDER_SEAM_STRONG),
     );
 
+    // Horizontal row underline — the missing axis of the grid (the vertical cell
+    // seams are drawn per cell above). Full width so the chain reads as a table.
+    painter.line_segment(
+        [
+            Pos2::new(rect.left(), rect.bottom()),
+            Pos2::new(rect.right(), rect.bottom()),
+        ],
+        Stroke::new(1.0, theme::BORDER_CELL),
+    );
+
     // Active-row marker: a 2px inset accent left border when either side is the
     // selected asset.
     let active = selected == Some(&row.yes_asset) || selected == Some(&row.no_asset);
