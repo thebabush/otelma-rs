@@ -536,10 +536,13 @@ impl ReplayApp {
             }
             Some(ui::ScrubAction::Click(t)) => {
                 self.scrub_preview = None;
-                self.ff_target = None;
+                let forward = state.current_ts.is_some_and(|c| t > c);
                 if let Source::Replay { feeder, .. } = &mut self.source {
                     feeder.seek_to(t);
                 }
+                // Same as a drag-release: a forward click sweeps at max, shown on
+                // the checkbox until the playhead reaches the target.
+                self.ff_target = forward.then_some(t);
             }
             None => {}
         }
