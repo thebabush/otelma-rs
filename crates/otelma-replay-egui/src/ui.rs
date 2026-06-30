@@ -997,6 +997,12 @@ const CHAIN_HANDLE_W: f32 = 7.0;
 /// Outcome-column clamp bounds (px).
 pub const CHAIN_COL_MIN: f32 = 90.0;
 pub const CHAIN_COL_MAX: f32 = 340.0;
+/// Chain grid line — a faint translucent white so the rules read over BOTH the
+/// dark outcome column and the green/red quadrant tints (an opaque dark seam like
+/// `BORDER_CELL` vanishes against the tint).
+const CHAIN_GRID: Color32 = Color32::from_rgba_premultiplied(22, 22, 22, 22);
+/// Zebra: a very mild white overlay applied to every other data row.
+const CHAIN_STRIPE: Color32 = Color32::from_rgba_premultiplied(8, 8, 8, 8);
 /// Cell horizontal padding (px), per spec (`padding 0×7`).
 const CELL_PAD: f32 = 7.0;
 /// Row-flash decay duration (s) — a calm ~0.18s ease-out back to the tint.
@@ -1204,6 +1210,7 @@ pub fn chain_grid(
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::ZERO;
                     let width = ui.available_width();
+                    let mut row_i = 0usize; // global parity for zebra striping
                     for group in groups {
                         // Section header (carries the market name + col labels +
                         // a resize handle).
@@ -1214,9 +1221,13 @@ pub fn chain_grid(
                         col_delta += chain_resize_handle(ui, &layout, rect);
 
                         for row in &group.rows {
-                            if chain_data_row(ui, accent, &layout, width, row, selected, flash) {
+                            let striped = row_i % 2 == 1;
+                            if chain_data_row(
+                                ui, accent, &layout, width, striped, row, selected, flash,
+                            ) {
                                 clicked = Some(row.yes_asset.clone());
                             }
+                            row_i += 1;
                         }
                     }
                 });
@@ -1349,6 +1360,7 @@ fn chain_data_row(
     accent: Accent,
     layout: &ChainLayout,
     width: f32,
+    striped: bool,
     row: &ChainRow,
     selected: Option<&AssetId>,
     flash: &mut BTreeMap<AssetId, RowFlash>,
@@ -1401,6 +1413,12 @@ fn chain_data_row(
         no_bg,
     );
 
+    // Zebra: a very mild light overlay on alternate rows, across the full width
+    // (over both the dark outcome column and the tinted blocks).
+    if striped {
+        painter.rect_filled(rect, 0.0, CHAIN_STRIPE);
+    }
+
     // Outcome name (clipped to the resizable column, ellipsis-like via clip).
     let name_rect = Rect::from_min_max(
         Pos2::new(layout.left + CELL_PAD, rect.top()),
@@ -1419,7 +1437,7 @@ fn chain_data_row(
             Pos2::new(layout.col_right(), rect.top()),
             Pos2::new(layout.col_right(), rect.bottom()),
         ],
-        Stroke::new(1.0, theme::BORDER_CELL),
+        Stroke::new(1.0, CHAIN_GRID),
     );
 
     // YES + NO cells.
@@ -1442,7 +1460,7 @@ fn chain_data_row(
             Pos2::new(rect.left(), rect.bottom()),
             Pos2::new(rect.right(), rect.bottom()),
         ],
-        Stroke::new(1.0, theme::BORDER_CELL),
+        Stroke::new(1.0, CHAIN_GRID),
     );
 
     // Active-row marker: a 2px inset accent left border when either side is the
@@ -1486,7 +1504,7 @@ fn chain_block_cells(
                 Pos2::new(x + col.width, rect.top()),
                 Pos2::new(x + col.width, rect.bottom()),
             ],
-            Stroke::new(1.0, theme::BORDER_CELL),
+            Stroke::new(1.0, CHAIN_GRID),
         );
         x += col.width;
     }
