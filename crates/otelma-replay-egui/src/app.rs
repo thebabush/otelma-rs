@@ -101,6 +101,10 @@ pub struct ReplayApp {
     tz: Timezone,
     /// Chart Y-axis scaling (`AUTO` fit vs fixed `0–1`).
     y_scale: YScale,
+    /// While dragging the scrubber: the previewed seek time (drawn as a follow
+    /// line on the plots). `None` when not dragging; the actual seek happens on
+    /// release. Render-only state.
+    scrub_preview: Option<DateTime<Utc>>,
     /// Whether fonts/visuals have been installed (done on first frame, where we
     /// have a `Context`).
     styled: bool,
@@ -140,6 +144,7 @@ impl ReplayApp {
             view: ViewMode::Chart,
             tz: Timezone::Local,
             y_scale: YScale::Auto,
+            scrub_preview: None,
             styled: false,
             started: Instant::now(),
         }
@@ -501,8 +506,9 @@ impl ReplayApp {
                 self.y_scale = ui::chart_header(ui, accent, &title, asset, self.y_scale);
             });
 
-        // Scrubber / timeline (48px, bottom). A drag returns a seek target.
-        let mut seek_target = None;
+        // Scrubber / timeline (48px, bottom). A drag only *previews* (a follow
+        // line on the plots); the seek is committed on release. A click seeks now.
+        let mut action = None;
         egui::Panel::bottom("scrubber")
             .exact_size(ui::SCRUBBER_H)
             .frame(
@@ -511,14 +517,32 @@ impl ReplayApp {
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(ui, |ui| {
-                seek_target =
-                    ui::scrubber(ui, accent, mode, self.tz, self.bounds, state.current_ts);
+                action = ui::scrubber(ui, accent, mode, self.tz, self.bounds, state.current_ts);
             });
-        if let (Some(target), Source::Replay { feeder, .. }) = (seek_target, &mut self.source) {
-            feeder.seek_to(target);
+        match action {
+            Some(ui::ScrubAction::Preview(t)) => self.scrub_preview = Some(t),
+            Some(ui::ScrubAction::Release) => {
+                if let Some(t) = self.scrub_preview.take() {
+                    if let Source::Replay { feeder, .. } = &mut self.source {
+                        feeder.seek_to(t);
+                    }
+                }
+            }
+            Some(ui::ScrubAction::Click(t)) => {
+                self.scrub_preview = None;
+                if let Source::Replay { feeder, .. } = &mut self.source {
+                    feeder.seek_to(t);
+                }
+            }
+            None => {}
         }
 
         let current_t = current_t_secs(state);
+        // Preview time in chart seconds (the scrubber's follow line while dragging).
+        let preview_t = self
+            .scrub_preview
+            .zip(state.start_ts)
+            .map(|(p, start)| (p - start).num_milliseconds() as f64 / 1000.0);
 
         // The remaining body splits into the price chart (top, fills) and the
         // volume sub-panel (bottom, fixed). They share one painter and one X
@@ -542,8 +566,11 @@ impl ReplayApp {
                     self.tz,
                     state.start_ts,
                     current_t,
+                    preview_t,
                 );
-                ui::volume_panel(painter, vol_rect, accent, asset, &xmap, current_t);
+                ui::volume_panel(
+                    painter, vol_rect, accent, asset, &xmap, current_t, preview_t,
+                );
             });
     }
 

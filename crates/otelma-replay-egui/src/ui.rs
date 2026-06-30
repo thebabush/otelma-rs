@@ -148,6 +148,7 @@ pub fn price_chart(
     tz: Timezone,
     start_ts: Option<DateTime<Utc>>,
     current_t: Option<f64>,
+    preview_t: Option<f64>,
 ) -> PlotXMap {
     let inner = Rect::from_min_max(
         Pos2::new(rect.left() + MARGIN_L, rect.top() + MARGIN_T),
@@ -263,6 +264,20 @@ pub fn price_chart(
         draw_dashed_v(painter, map.px(t), inner.top(), inner.bottom(), accent.dim);
     }
 
+    // Scrub-preview line (solid accent) while dragging the scrubber — shows where
+    // a release would seek to, without moving the playhead.
+    if let Some(pt) = preview_t {
+        if pt >= x.min && pt <= x.max {
+            painter.line_segment(
+                [
+                    Pos2::new(map.px(pt), inner.top()),
+                    Pos2::new(map.px(pt), inner.bottom()),
+                ],
+                Stroke::new(1.5, accent.base),
+            );
+        }
+    }
+
     PlotXMap {
         inner_left: inner.left(),
         inner_width: inner.width(),
@@ -292,6 +307,7 @@ pub fn volume_panel(
     asset: Option<&AssetState>,
     xmap: &PlotXMap,
     current_t: Option<f64>,
+    preview_t: Option<f64>,
 ) {
     let baseline_y = rect.bottom() - MARGIN_B * 0.5;
     let top_y = rect.top() + 14.0;
@@ -352,6 +368,18 @@ pub fn volume_panel(
     // Same dashed playhead as the chart, so the two panels align.
     if let Some(t) = current_t {
         draw_dashed_v(painter, xmap.px(t), top_y, baseline_y, accent.dim);
+    }
+    // Scrub-preview line, aligned with the chart's.
+    if let Some(pt) = preview_t {
+        if pt >= xmap.x.min && pt <= xmap.x.max {
+            painter.line_segment(
+                [
+                    Pos2::new(xmap.px(pt), top_y),
+                    Pos2::new(xmap.px(pt), baseline_y),
+                ],
+                Stroke::new(1.5, accent.base),
+            );
+        }
     }
 }
 
@@ -716,10 +744,24 @@ fn bid_depth_bar() -> Color32 {
 /// Scrubber/timeline height (px).
 pub const SCRUBBER_H: f32 = 48.0;
 
-/// Render the scrubber. In REPLAY, `bounds` is the session `[start, end]` and a
-/// drag maps the x-fraction to a target time, returned as `Some(target)` to seek.
-/// In LIVE, `bounds` is `None`: the track pins at 100% and is disabled, the right
-/// label reads `LIVE`, and `None` is always returned (no seek).
+/// What a scrubber interaction wants done. A *drag* only previews (so the plots
+/// can show a follow line) and the seek is committed on release; a plain *click*
+/// seeks directly.
+pub enum ScrubAction {
+    /// Dragging to this time — show the preview line; do NOT seek yet.
+    Preview(DateTime<Utc>),
+    /// Drag released — commit the seek to the last previewed time.
+    Release,
+    /// A click (no drag) at this time — seek immediately.
+    Click(DateTime<Utc>),
+}
+
+/// Render the scrubber and report the interaction as a [`ScrubAction`]. In
+/// REPLAY, `bounds` is the session `[start, end]`: a drag *previews* a time (the
+/// caller draws a follow line and seeks on [`ScrubAction::Release`]), a click
+/// seeks immediately, and the time bubble shows only while hovering/dragging. In
+/// LIVE, `bounds` is `None`: the track pins at 100%, is disabled, the right label
+/// reads `LIVE`, and `None` is always returned (no seek).
 pub fn scrubber(
     ui: &mut egui::Ui,
     accent: Accent,
@@ -727,7 +769,7 @@ pub fn scrubber(
     tz: Timezone,
     bounds: Option<(DateTime<Utc>, DateTime<Utc>)>,
     current_ts: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
+) -> Option<ScrubAction> {
     let full = ui.max_rect();
     // Top border seam.
     ui.painter().line_segment(
@@ -763,9 +805,22 @@ pub fn scrubber(
             _ => 0.0,
         }
     } as f32;
+    let playhead_x = track_left + frac * track_w;
 
-    // Interaction: a drag over the track seeks (REPLAY only).
-    let mut seek: Option<DateTime<Utc>> = None;
+    // Map a track x back to a recorded time.
+    let time_at = |x: f32| -> Option<DateTime<Utc>> {
+        let (start, end) = bounds?;
+        let f = ((x - track_left) / track_w).clamp(0.0, 1.0) as f64;
+        let span_ms = (end - start).num_milliseconds() as f64;
+        Some(start + Duration::milliseconds((f * span_ms) as i64))
+    };
+
+    // Interaction (REPLAY only). A drag only previews (no seek until release); a
+    // click seeks directly. `scrub_x` is the cursor x while hovering or dragging —
+    // used for the bubble, and (while dragging) for the handle.
+    let mut action = None;
+    let mut scrub_x: Option<f32> = None;
+    let mut dragging = false;
     let track_rect = Rect::from_min_max(
         Pos2::new(track_left, full.top()),
         Pos2::new(track_right, full.bottom()),
@@ -776,14 +831,20 @@ pub fn scrubber(
             ui.id().with("scrubber_track"),
             Sense::click_and_drag(),
         );
-        if (resp.dragged() || resp.clicked()) && track_w > 0.0 {
-            if let (Some((start, end)), Some(pos)) = (bounds, resp.interact_pointer_pos()) {
-                let f = ((pos.x - track_left) / track_w).clamp(0.0, 1.0) as f64;
-                let span_ms = (end - start).num_milliseconds() as f64;
-                seek = Some(start + Duration::milliseconds((f * span_ms) as i64));
+        dragging = resp.dragged();
+        if let Some(pos) = resp.interact_pointer_pos().or(resp.hover_pos()) {
+            let cx = pos.x.clamp(track_left, track_right);
+            scrub_x = Some(cx);
+            if resp.dragged() {
+                action = time_at(cx).map(ScrubAction::Preview);
+            } else if resp.clicked() {
+                action = time_at(cx).map(ScrubAction::Click);
             }
         }
-        if resp.hovered() {
+        if resp.drag_stopped() {
+            action = Some(ScrubAction::Release);
+        }
+        if resp.hovered() || resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
     }
@@ -799,8 +860,15 @@ pub fn scrubber(
     );
     painter.rect_filled(track_bar, 2.0, dim(theme::BG_CONTROL));
 
-    // Filled portion (left → playhead) in accent at ~55%.
-    let handle_x = track_left + frac * track_w;
+    // Handle follows the cursor while dragging (a preview of where a release would
+    // seek); otherwise it sits at the actual playhead.
+    let handle_x = if dragging {
+        scrub_x.unwrap_or(playhead_x)
+    } else {
+        playhead_x
+    };
+
+    // Filled portion (left → handle) in accent at ~55%.
     let fill = Rect::from_min_max(
         Pos2::new(track_left, track_y - 2.0),
         Pos2::new(handle_x, track_y + 2.0),
@@ -810,27 +878,30 @@ pub fn scrubber(
     // Handle circle.
     painter.circle_filled(Pos2::new(handle_x, track_y), 5.5, dim(accent.base));
 
-    // Time bubble above the handle (playhead clock, in tz). It floats ~22px above
-    // the track — above the short scrubber panel — so paint it on a foreground
-    // layer (full-screen clip), else the panel slices it in half.
-    if let Some(now) = current_ts {
-        let bp = ui.ctx().layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            ui.id().with("scrubber_bubble"),
-        ));
-        let bubble_center = Pos2::new(handle_x, track_y - 22.0);
-        let text = theme::format_clock(now, tz);
-        let galley = bp.layout_no_wrap(text, mono(9.5), dim(accent.base));
-        let pad = Vec2::new(5.0, 2.0);
-        let bubble = Rect::from_center_size(bubble_center, galley.size() + pad * 2.0);
-        bp.rect_filled(bubble, 3.0, theme::BG_INPUT);
-        bp.rect_stroke(
-            bubble,
-            3.0,
-            Stroke::new(1.0, dim(accent.base)),
-            egui::StrokeKind::Inside,
-        );
-        bp.galley(bubble.min + pad, galley, dim(accent.base));
+    // Time bubble — shown ONLY while hovering or dragging the track (the toolbar
+    // already shows the playhead clock). It reads the time under the cursor, and
+    // floats above the track on a foreground layer so the short panel can't slice
+    // it.
+    if let Some(cx) = scrub_x {
+        if let Some(t) = time_at(cx) {
+            let bp = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                ui.id().with("scrubber_bubble"),
+            ));
+            let text = theme::format_clock(t, tz);
+            let galley = bp.layout_no_wrap(text, mono(9.5), accent.base);
+            let pad = Vec2::new(5.0, 2.0);
+            let bubble =
+                Rect::from_center_size(Pos2::new(cx, track_y - 22.0), galley.size() + pad * 2.0);
+            bp.rect_filled(bubble, 3.0, theme::BG_INPUT);
+            bp.rect_stroke(
+                bubble,
+                3.0,
+                Stroke::new(1.0, accent.base),
+                egui::StrokeKind::Inside,
+            );
+            bp.galley(bubble.min + pad, galley, accent.base);
+        }
     }
 
     // Start label (left) and end / LIVE label (right).
@@ -860,5 +931,5 @@ pub fn scrubber(
         },
     );
 
-    seek
+    action
 }
