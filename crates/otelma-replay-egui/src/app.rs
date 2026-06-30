@@ -1,5 +1,5 @@
 //! The eframe application: a terminal-style shell (title bar, toolbar, footer)
-//! around a flexible body that hosts the price chart (or a CHAIN placeholder).
+//! around a flexible body that hosts the price chart or the dense CHAIN grid.
 //!
 //! Strict layering: this file is the **render layer** — egui only, no business
 //! logic. The view-model lives in [`crate::state`] (egui-free); the typed design
@@ -9,6 +9,7 @@
 //! [`eframe::App::ui`] (a root [`egui::Ui`] with no margin), inside which we lay
 //! out panels via `Panel::show(ui, …)`.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
@@ -91,6 +92,15 @@ pub struct ReplayApp {
     selected_asset: Option<AssetId>,
     /// Live search-box text filtering the market sidebar.
     search_query: String,
+    /// The CHAIN view's own search-box text (independent of the sidebar filter).
+    chain_query: String,
+    /// The CHAIN outcome-column width (px), user-resizable, clamped to
+    /// `[CHAIN_COL_MIN, CHAIN_COL_MAX]`.
+    chain_col_w: f32,
+    /// Render-side row-flash state for the CHAIN grid, keyed by each entity's YES
+    /// asset id. A `BTreeMap` keeps iteration deterministic; the flash itself is a
+    /// wall-clock animation (like the pill blink), off the determinism path.
+    chain_flash: BTreeMap<AssetId, ui::RowFlash>,
     /// REPLAY session `[start, end]` bounds for the scrubber, read once from the
     /// recording (cheap Parquet stats). `None` in LIVE (no fixed end) or if the
     /// recording can't be probed.
@@ -143,6 +153,9 @@ impl ReplayApp {
             source,
             selected_asset: None,
             search_query: String::new(),
+            chain_query: String::new(),
+            chain_col_w: 150.0,
+            chain_flash: BTreeMap::new(),
             bounds,
             view: ViewMode::Chart,
             tz: Timezone::Local,
@@ -439,7 +452,7 @@ impl ReplayApp {
     fn body_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
         match self.view {
             ViewMode::Chart => self.chart_body_ui(ui, state),
-            ViewMode::Chain => self.chain_placeholder_ui(ui),
+            ViewMode::Chain => self.chain_body_ui(ui, state),
         }
     }
 
@@ -549,7 +562,9 @@ impl ReplayApp {
             None => {}
         }
 
-        let current_t = current_t_secs(state);
+        // The chart wants `None` before any data (no playhead line); otherwise the
+        // shared playhead time from the view-model's `current_t_secs`.
+        let current_t = state.current_ts.map(|_| state.current_t_secs());
         // Preview time in chart seconds (the scrubber's follow line while dragging).
         let preview_t = self
             .scrub_preview
@@ -586,25 +601,31 @@ impl ReplayApp {
             });
     }
 
-    fn chain_placeholder_ui(&self, ui: &mut egui::Ui) {
-        ui.centered_and_justified(|ui| {
-            ui.label(
-                RichText::new("CHAIN view — coming in a later deliverable")
-                    .size(11.0)
-                    .color(theme::TEXT_DIMMER),
-            );
-        });
+    /// CHAIN body: the dense, searchable option-chain grid (search bar, sticky
+    /// YES/NO band, repeating per-market headers, data rows).
+    fn chain_body_ui(&mut self, ui: &mut egui::Ui, state: &ReplayState) {
+        let accent = theme::accent_for(self.source.mode());
+        let groups = state.chain_view(&self.chain_query);
+        let (clicked, col_delta) = ui::chain_grid(
+            ui,
+            accent,
+            &mut self.chain_query,
+            &groups,
+            self.selected_asset.as_ref(),
+            self.chain_col_w,
+            &mut self.chain_flash,
+        );
+        // Apply the resize-handle drag, clamped to the spec bounds.
+        if col_delta != 0.0 {
+            self.chain_col_w =
+                (self.chain_col_w + col_delta).clamp(ui::CHAIN_COL_MIN, ui::CHAIN_COL_MAX);
+        }
+        // Clicking a row selects that entity's YES asset (so switching back to the
+        // CHART view charts it).
+        if let Some(asset) = clicked {
+            self.selected_asset = Some(asset);
+        }
     }
-}
-
-/// The playhead time in seconds since the session start: the latest applied
-/// message timestamp relative to the first. Derived only from recorded message
-/// times (`current_ts`/`start_ts`) — never the wall clock — so it stays on the
-/// determinism path. `None` before any data arrives.
-fn current_t_secs(state: &ReplayState) -> Option<f64> {
-    let start = state.start_ts?;
-    let now = state.current_ts?;
-    Some((now - start).num_milliseconds() as f64 / 1000.0)
 }
 
 /// Probe a recording's `[start, end]` span for the scrubber via the engine's

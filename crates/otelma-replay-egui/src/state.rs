@@ -205,9 +205,6 @@ impl ReplayState {
     /// (1-decimal seconds for `LAST`, signed cents for `CHG¢`/`SPR¢`, etc.), the
     /// YES/NO quadrant tints, the trade row-flash, and the resizable outcome
     /// column. D3a derives the numbers; it never formats or styles them.
-    // Consumed by the CHAIN renderer in D3b; until then only the unit tests
-    // exercise it, so the non-test build sees the whole chain as unused.
-    #[allow(dead_code)]
     pub fn chain_view(&self, filter: &str) -> Vec<ChainGroup> {
         let needle = filter.trim().to_lowercase();
         let now_secs = self.current_t_secs();
@@ -344,6 +341,17 @@ pub struct SideStats {
     pub last_secs: Option<f64>,
     /// Cumulative traded/changed volume (sum of every [`VolumePoint::volume`]).
     pub vol: f64,
+    /// Absolute `t_secs` of this asset's most recent trade (the last
+    /// [`TradePoint::t_secs`]), or `None` if it never traded. The renderer
+    /// compares this across frames to detect a *new* trade and fire the row-flash;
+    /// it is a raw view-model number, not a wall-clock time.
+    pub last_trade_t: Option<f64>,
+    /// Direction of the most recent trade, for the flash colour: `Some(true)` =
+    /// up/green (last [`TradePoint`] was a [`Side::Buy`]), `Some(false)` =
+    /// down/red (a [`Side::Sell`]). A trade with no recorded side reuses the
+    /// asset's latest tick direction (`last_dir_up`). `None` only when the asset
+    /// has never traded.
+    pub last_trade_up: Option<bool>,
 }
 
 impl SideStats {
@@ -362,8 +370,18 @@ impl SideStats {
             (Some(first), Some(now)) => Some((now.mid - first.mid) * 100.0),
             _ => None,
         };
-        // Seconds since the asset's most recent trade.
-        let last_secs = state.trades.last().map(|t| now_secs - t.t_secs);
+        // The asset's most recent trade drives staleness, the flash trigger, and
+        // the flash colour.
+        let last_trade = state.trades.last();
+        let last_secs = last_trade.map(|t| now_secs - t.t_secs);
+        let last_trade_t = last_trade.map(|t| t.t_secs);
+        // Flash colour: a Buy reads up (green), a Sell down (red); a trade with
+        // no recorded side reuses the asset's latest tick direction.
+        let last_trade_up = last_trade.map(|t| match t.side {
+            Some(Side::Buy) => true,
+            Some(Side::Sell) => false,
+            None => state.last_dir_up,
+        });
         let vol = state.volume.iter().map(|v| v.volume).sum();
         Self {
             bid,
@@ -374,6 +392,8 @@ impl SideStats {
             chg_cents,
             last_secs,
             vol,
+            last_trade_t,
+            last_trade_up,
         }
     }
 }
@@ -1161,12 +1181,65 @@ mod tests {
         assert!((y.last_secs.expect("last") - 10.0).abs() < 1e-9);
         // Volume = trade size only (no price_change) = 4.
         assert!((y.vol - 4.0).abs() < 1e-9);
+        // Flash inputs: the last trade was at t=10, a Buy ⇒ up.
+        assert!((y.last_trade_t.expect("trade t") - 10.0).abs() < 1e-9);
+        assert_eq!(y.last_trade_up, Some(true));
 
-        // The NO side (no-arg) has no data at all: default stats.
+        // The NO side (no-arg) has no data at all: default stats (and no flash).
         assert_eq!(arg.no, SideStats::default());
         assert_eq!(arg.no.bid, None);
         assert_eq!(arg.no.last_secs, None);
         assert_eq!(arg.no.vol, 0.0);
+        assert_eq!(arg.no.last_trade_t, None);
+        assert_eq!(arg.no.last_trade_up, None);
+    }
+
+    #[test]
+    fn side_stats_flash_inputs_track_last_trade_direction() {
+        let mut state = ReplayState::default();
+        {
+            let mut sink = GuiSink::new(&mut state);
+            // Open book → mid 0.50.
+            sink.apply(&book_msg(
+                0,
+                0,
+                "A",
+                vec![lvl(dec!(0.49), dec!(1))],
+                vec![lvl(dec!(0.51), dec!(1))],
+            ));
+            // A Sell trade ⇒ down/red.
+            sink.apply(&trade_msg(
+                1,
+                5,
+                "A",
+                Some(dec!(0.50)),
+                Some(dec!(2)),
+                Some(Side::Sell),
+            ));
+        }
+        let now = state.current_t_secs();
+        let s = SideStats::from_asset(&state.assets[&AssetId::from("A")], now);
+        assert_eq!(s.last_trade_t, Some(5.0));
+        assert_eq!(s.last_trade_up, Some(false));
+
+        // A sideless trade reuses the asset's latest tick direction. Drop the
+        // mid (so the tick reads down), then print a trade with no side.
+        {
+            let mut sink = GuiSink::new(&mut state);
+            sink.apply(&book_msg(
+                2,
+                6,
+                "A",
+                vec![lvl(dec!(0.39), dec!(1))],
+                vec![lvl(dec!(0.41), dec!(1))],
+            ));
+            sink.apply(&trade_msg(3, 7, "A", Some(dec!(0.40)), Some(dec!(1)), None));
+        }
+        let now = state.current_t_secs();
+        let s = SideStats::from_asset(&state.assets[&AssetId::from("A")], now);
+        assert_eq!(s.last_trade_t, Some(7.0));
+        // Mid fell 0.50 → 0.40 ⇒ tick down ⇒ the sideless trade flashes red.
+        assert_eq!(s.last_trade_up, Some(false));
     }
 
     #[test]

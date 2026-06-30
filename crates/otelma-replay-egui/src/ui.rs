@@ -1,5 +1,6 @@
-//! Bespoke painters for the CHART view's center column: the chart header, the
-//! price chart, and the volume sub-panel.
+//! Bespoke painters and widgets for the replayer body: the CHART view (chart
+//! header, price chart, volume sub-panel), the left market sidebar, the
+//! order-book ladder, the scrubber, and the dense CHAIN grid.
 //!
 //! Strict layering: this is **render-only** (egui/painter). Every range, window,
 //! and extremum comes from the egui-free view-model ([`crate::state`]) and the
@@ -12,8 +13,11 @@ use egui::RichText;
 
 use otelma_polymarket::AssetId;
 
+use std::collections::BTreeMap;
+use std::time::Instant;
+
 use crate::series::{self, LadderSide, Range, SeriesMode, YScale, LADDER_DEPTH};
-use crate::state::{AssetState, MarketGroup};
+use crate::state::{AssetState, ChainGroup, ChainRow, MarketGroup, SideStats};
 use crate::theme::{self, Accent, Mode, Timezone};
 
 /// Plot margins (px), per the design spec.
@@ -976,4 +980,651 @@ pub fn scrubber(
     );
 
     action
+}
+
+// ── CHAIN grid ────────────────────────────────────────────────────────────────
+
+/// CHAIN search-bar height (px).
+const CHAIN_SEARCH_H: f32 = 44.0;
+/// Sticky YES/NO band height (px).
+const CHAIN_BAND_H: f32 = 17.0;
+/// Per-market section-header height (px).
+const CHAIN_SECTION_H: f32 = 22.0;
+/// Data-row height (px).
+const CHAIN_ROW_H: f32 = 21.0;
+/// Outcome-column resize handle width (px).
+const CHAIN_HANDLE_W: f32 = 7.0;
+/// Outcome-column clamp bounds (px).
+pub const CHAIN_COL_MIN: f32 = 90.0;
+pub const CHAIN_COL_MAX: f32 = 340.0;
+/// Cell horizontal padding (px), per spec (`padding 0×7`).
+const CELL_PAD: f32 = 7.0;
+/// Row-flash decay duration (s) — a calm ~0.18s ease-out back to the tint.
+const FLASH_DECAY_SECS: f32 = 0.18;
+
+/// One column in a YES (or NO) book block: its label and fixed pixel width.
+struct ChainCol {
+    label: &'static str,
+    width: f32,
+    kind: CellKind,
+}
+
+/// Which datum a cell shows (drives its formatting + colour).
+#[derive(Clone, Copy)]
+enum CellKind {
+    Last,
+    Vol,
+    Chg,
+    Spr,
+    BidSz,
+    Bid,
+    Ask,
+    AskSz,
+}
+
+/// The YES block columns, outer→center (the quote sits innermost).
+const YES_COLS: [ChainCol; 8] = [
+    ChainCol {
+        label: "LAST",
+        width: 54.0,
+        kind: CellKind::Last,
+    },
+    ChainCol {
+        label: "VOL",
+        width: 60.0,
+        kind: CellKind::Vol,
+    },
+    ChainCol {
+        label: "CHG¢",
+        width: 46.0,
+        kind: CellKind::Chg,
+    },
+    ChainCol {
+        label: "SPR¢",
+        width: 44.0,
+        kind: CellKind::Spr,
+    },
+    ChainCol {
+        label: "BID SZ",
+        width: 62.0,
+        kind: CellKind::BidSz,
+    },
+    ChainCol {
+        label: "BID",
+        width: 52.0,
+        kind: CellKind::Bid,
+    },
+    ChainCol {
+        label: "ASK",
+        width: 52.0,
+        kind: CellKind::Ask,
+    },
+    ChainCol {
+        label: "ASK SZ",
+        width: 62.0,
+        kind: CellKind::AskSz,
+    },
+];
+
+/// The NO block columns mirror YES (center→outer): the quote sits innermost.
+const NO_COLS: [ChainCol; 8] = [
+    ChainCol {
+        label: "BID SZ",
+        width: 62.0,
+        kind: CellKind::BidSz,
+    },
+    ChainCol {
+        label: "BID",
+        width: 52.0,
+        kind: CellKind::Bid,
+    },
+    ChainCol {
+        label: "ASK",
+        width: 52.0,
+        kind: CellKind::Ask,
+    },
+    ChainCol {
+        label: "ASK SZ",
+        width: 62.0,
+        kind: CellKind::AskSz,
+    },
+    ChainCol {
+        label: "SPR¢",
+        width: 44.0,
+        kind: CellKind::Spr,
+    },
+    ChainCol {
+        label: "CHG¢",
+        width: 46.0,
+        kind: CellKind::Chg,
+    },
+    ChainCol {
+        label: "VOL",
+        width: 60.0,
+        kind: CellKind::Vol,
+    },
+    ChainCol {
+        label: "LAST",
+        width: 54.0,
+        kind: CellKind::Last,
+    },
+];
+
+/// Sum of one block's column widths.
+fn block_width() -> f32 {
+    YES_COLS.iter().map(|c| c.width).sum()
+}
+
+/// The horizontal geometry shared by the band, section headers, and rows: where
+/// the outcome column ends and where the YES / NO blocks start, so every row's
+/// cells line up. The YES|NO book is centered in the space right of the outcome
+/// column (a flex spacer on each side).
+struct ChainLayout {
+    /// Left edge of the whole grid.
+    left: f32,
+    /// Resizable outcome-column width (right border at `left + col_w`).
+    col_w: f32,
+    /// Left edge of the YES block.
+    yes_left: f32,
+    /// Left edge of the NO block (== YES block right edge; the center seam).
+    no_left: f32,
+    /// One block's total width.
+    block_w: f32,
+}
+
+impl ChainLayout {
+    fn new(full: Rect, col_w: f32) -> Self {
+        let block_w = block_width();
+        let books_w = block_w * 2.0;
+        let region_left = full.left() + col_w;
+        // Centre the YES|NO book in the space to the right of the outcome column.
+        let spacer = ((full.right() - region_left) - books_w).max(0.0) * 0.5;
+        let yes_left = region_left + spacer;
+        Self {
+            left: full.left(),
+            col_w,
+            yes_left,
+            no_left: yes_left + block_w,
+            block_w,
+        }
+    }
+
+    /// Right edge of the outcome column.
+    fn col_right(&self) -> f32 {
+        self.left + self.col_w
+    }
+}
+
+/// Render the whole CHAIN view: the search bar, the sticky YES/NO band, and a
+/// scrollable grid of per-market sections (each a repeating header + data rows).
+///
+/// `query` is the live filter text (mutated by the search box). `groups` is the
+/// already-filtered view-model. `col_w` is the app-owned outcome-column width;
+/// the returned delta (from the resize handle drag) is added by the caller and
+/// re-clamped. `flash` is render-only animation state (per-asset trade-flash
+/// start + direction), keyed by the entity's YES asset id. Returns `(clicked,
+/// col_delta)`: `clicked` is the YES asset of a clicked row (selects the
+/// entity); `col_delta` is the resize-handle drag this frame.
+pub fn chain_grid(
+    ui: &mut egui::Ui,
+    accent: Accent,
+    query: &mut String,
+    groups: &[ChainGroup],
+    selected: Option<&AssetId>,
+    col_w: f32,
+    flash: &mut BTreeMap<AssetId, RowFlash>,
+) -> (Option<AssetId>, f32) {
+    let outcomes: usize = groups.iter().map(|g| g.rows.len()).sum();
+
+    // Search bar (top, fixed height, bottom border).
+    egui::Panel::top("chain_search")
+        .exact_size(CHAIN_SEARCH_H)
+        .frame(egui::Frame::default().fill(theme::BG_WINDOW))
+        .show(ui, |ui| {
+            chain_search_bar(ui, query, outcomes);
+        });
+
+    // Sticky YES/NO band (pinned above the scroll area).
+    egui::Panel::top("chain_band")
+        .exact_size(CHAIN_BAND_H)
+        .frame(egui::Frame::default().fill(theme::BG_WINDOW))
+        .show(ui, |ui| {
+            let layout = ChainLayout::new(ui.max_rect(), col_w);
+            chain_band(ui.painter(), ui.max_rect(), &layout);
+        });
+
+    // Scrollable grid body.
+    let mut clicked: Option<AssetId> = None;
+    let mut col_delta = 0.0;
+    egui::CentralPanel::default()
+        .frame(egui::Frame::default().fill(theme::BG_WINDOW))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    let width = ui.available_width();
+                    for group in groups {
+                        // Section header (carries the market name + col labels +
+                        // a resize handle).
+                        let (rect, _) = ui
+                            .allocate_exact_size(Vec2::new(width, CHAIN_SECTION_H), Sense::hover());
+                        let layout = ChainLayout::new(rect, col_w);
+                        chain_section_header(ui.painter(), rect, &layout, &group.title);
+                        col_delta += chain_resize_handle(ui, &layout, rect);
+
+                        for row in &group.rows {
+                            if chain_data_row(ui, accent, &layout, width, row, selected, flash) {
+                                clicked = Some(row.yes_asset.clone());
+                            }
+                        }
+                    }
+                });
+        });
+
+    (clicked, col_delta)
+}
+
+/// The CHAIN search bar: a `⌕` glyph + bounded text input, plus a right-aligned
+/// `<N> OUTCOMES` count. Mirrors the sidebar search idiom.
+fn chain_search_bar(ui: &mut egui::Ui, query: &mut String, outcomes: usize) {
+    // Bottom border seam.
+    let full = ui.max_rect();
+    ui.painter().line_segment(
+        [
+            Pos2::new(full.left(), full.bottom()),
+            Pos2::new(full.right(), full.bottom()),
+        ],
+        Stroke::new(1.0, theme::BORDER_STRONG),
+    );
+
+    ui.horizontal_centered(|ui| {
+        ui.add_space(11.0);
+        let edit = egui::TextEdit::singleline(query)
+            .hint_text(RichText::new("search markets & outcomes…").color(theme::TEXT_DIMMER))
+            .desired_width(300.0);
+        ui.add(edit);
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(11.0);
+            ui.label(
+                RichText::new(format!("{outcomes} OUTCOMES"))
+                    .size(10.0)
+                    .color(theme::TEXT_FAINT),
+            );
+        });
+    });
+}
+
+/// The sticky YES/NO band: `YES` centered over the YES block (green), `NO` over
+/// the NO block (red); the outcome-column slot is left empty.
+fn chain_band(painter: &egui::Painter, rect: Rect, layout: &ChainLayout) {
+    let y = rect.center().y;
+    painter.text(
+        Pos2::new(layout.yes_left + layout.block_w * 0.5, y),
+        Align2::CENTER_CENTER,
+        "YES",
+        mono(8.5),
+        theme::GREEN,
+    );
+    painter.text(
+        Pos2::new(layout.no_left + layout.block_w * 0.5, y),
+        Align2::CENTER_CENTER,
+        "NO",
+        mono(8.5),
+        theme::RED,
+    );
+}
+
+/// A per-market section header: the market name in the outcome slot (ellipsis),
+/// then center-aligned column labels for the YES and NO blocks. Background +
+/// bottom border per spec.
+fn chain_section_header(painter: &egui::Painter, rect: Rect, layout: &ChainLayout, title: &str) {
+    painter.rect_filled(rect, 0.0, theme::BG_TOOLBAR);
+    painter.line_segment(
+        [
+            Pos2::new(rect.left(), rect.bottom()),
+            Pos2::new(rect.right(), rect.bottom()),
+        ],
+        Stroke::new(1.0, theme::BORDER_STRONG),
+    );
+
+    // Market name in the outcome-column slot (clipped to the column).
+    let name_rect = Rect::from_min_max(
+        Pos2::new(layout.left + CELL_PAD, rect.top()),
+        Pos2::new(layout.col_right() - CELL_PAD, rect.bottom()),
+    );
+    painter.with_clip_rect(name_rect).text(
+        Pos2::new(name_rect.left(), rect.center().y),
+        Align2::LEFT_CENTER,
+        title,
+        mono(9.0),
+        theme::TEXT_MUTED,
+    );
+
+    // Column labels, center-aligned per column, for both blocks.
+    let y = rect.center().y;
+    let paint_labels = |block_left: f32, cols: &[ChainCol]| {
+        let mut x = block_left;
+        for col in cols {
+            painter.text(
+                Pos2::new(x + col.width * 0.5, y),
+                Align2::CENTER_CENTER,
+                col.label,
+                mono(9.0),
+                theme::TEXT_DIMMER,
+            );
+            x += col.width;
+        }
+    };
+    paint_labels(layout.yes_left, &YES_COLS);
+    paint_labels(layout.no_left, &NO_COLS);
+}
+
+/// The 7px invisible drag handle on the outcome column's right edge. Returns the
+/// width delta this frame (drag x-motion), clamped by the caller.
+fn chain_resize_handle(ui: &mut egui::Ui, layout: &ChainLayout, rect: Rect) -> f32 {
+    let handle = Rect::from_min_max(
+        Pos2::new(layout.col_right() - CHAIN_HANDLE_W * 0.5, rect.top()),
+        Pos2::new(layout.col_right() + CHAIN_HANDLE_W * 0.5, rect.bottom()),
+    );
+    let resp = ui.interact(
+        handle,
+        ui.id().with(("chain_col_handle", rect.top().to_bits())),
+        Sense::drag(),
+    );
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    resp.drag_delta().x
+}
+
+/// One CHAIN data row: outcome name (resizable left column, ellipsis), then the
+/// YES then NO book cells. Carries the resting quadrant tint, the trade
+/// row-flash (decaying over the tint), and the active-row accent marker. Returns
+/// `true` if the row was clicked.
+#[allow(clippy::too_many_arguments)]
+fn chain_data_row(
+    ui: &mut egui::Ui,
+    accent: Accent,
+    layout: &ChainLayout,
+    width: f32,
+    row: &ChainRow,
+    selected: Option<&AssetId>,
+    flash: &mut BTreeMap<AssetId, RowFlash>,
+) -> bool {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, CHAIN_ROW_H), Sense::hover());
+    let resp = ui.interact(
+        rect,
+        ui.id().with(("chain_row", row.yes_asset.as_str())),
+        Sense::click(),
+    );
+
+    // Trade flash: detect a *new* trade for the entity (either side) by comparing
+    // the latest trade time against what we last recorded, then start/refresh the
+    // flash (wall-clock animation only — not on the data path).
+    let trade = latest_trade(&row.yes, &row.no);
+    let flash_factor = update_flash(flash, &row.yes_asset, trade);
+
+    let painter = ui.painter();
+
+    // YES / NO resting tints, blended with any active flash colour.
+    let yes_tint = blend_over(theme::GREEN, theme::BG_WINDOW, 33); // ~.13
+    let no_tint = blend_over(theme::RED, theme::BG_WINDOW, 31); // ~.12
+    let (yes_bg, no_bg) = match flash_factor {
+        Some((up, f)) => {
+            // Flash target ~.34 alpha of the up/down colour, decaying to the tint.
+            let flash_col = if up { theme::GREEN } else { theme::RED };
+            let target = blend_over(flash_col, theme::BG_WINDOW, 87);
+            let a = lerp_color(yes_tint, target, f);
+            let b = lerp_color(no_tint, target, f);
+            (a, b)
+        }
+        None => (yes_tint, no_tint),
+    };
+
+    // Paint the block backgrounds (the tint/flash quadrants).
+    painter.rect_filled(
+        Rect::from_min_max(
+            Pos2::new(layout.yes_left, rect.top()),
+            Pos2::new(layout.no_left, rect.bottom()),
+        ),
+        0.0,
+        yes_bg,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(
+            Pos2::new(layout.no_left, rect.top()),
+            Pos2::new(layout.no_left + layout.block_w, rect.bottom()),
+        ),
+        0.0,
+        no_bg,
+    );
+
+    // Outcome name (clipped to the resizable column, ellipsis-like via clip).
+    let name_rect = Rect::from_min_max(
+        Pos2::new(layout.left + CELL_PAD, rect.top()),
+        Pos2::new(layout.col_right() - CELL_PAD, rect.bottom()),
+    );
+    painter.with_clip_rect(name_rect).text(
+        Pos2::new(name_rect.left(), rect.center().y),
+        Align2::LEFT_CENTER,
+        &row.outcome,
+        mono(11.0),
+        theme::TEXT_PRIMARY,
+    );
+    // Outcome-column right border.
+    painter.line_segment(
+        [
+            Pos2::new(layout.col_right(), rect.top()),
+            Pos2::new(layout.col_right(), rect.bottom()),
+        ],
+        Stroke::new(1.0, theme::BORDER_CELL),
+    );
+
+    // YES + NO cells.
+    chain_block_cells(painter, rect, layout.yes_left, &YES_COLS, &row.yes);
+    chain_block_cells(painter, rect, layout.no_left, &NO_COLS, &row.no);
+
+    // Center seam (stronger) where YES's ASK SZ meets NO's BID SZ.
+    painter.line_segment(
+        [
+            Pos2::new(layout.no_left, rect.top()),
+            Pos2::new(layout.no_left, rect.bottom()),
+        ],
+        Stroke::new(1.0, theme::BORDER_SEAM_STRONG),
+    );
+
+    // Active-row marker: a 2px inset accent left border when either side is the
+    // selected asset.
+    let active = selected == Some(&row.yes_asset) || selected == Some(&row.no_asset);
+    if active {
+        painter.rect_filled(
+            Rect::from_min_max(rect.min, Pos2::new(rect.left() + 2.0, rect.bottom())),
+            0.0,
+            accent.base,
+        );
+    }
+
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.clicked()
+}
+
+/// Paint one block's eight cells (right-aligned values + 1px right seams).
+fn chain_block_cells(
+    painter: &egui::Painter,
+    rect: Rect,
+    block_left: f32,
+    cols: &[ChainCol],
+    side: &SideStats,
+) {
+    let mut x = block_left;
+    for col in cols {
+        let (text, color) = cell_text(col.kind, side);
+        painter.text(
+            Pos2::new(x + col.width - CELL_PAD, rect.center().y),
+            Align2::RIGHT_CENTER,
+            text,
+            mono(11.0),
+            color,
+        );
+        // 1px right border.
+        painter.line_segment(
+            [
+                Pos2::new(x + col.width, rect.top()),
+                Pos2::new(x + col.width, rect.bottom()),
+            ],
+            Stroke::new(1.0, theme::BORDER_CELL),
+        );
+        x += col.width;
+    }
+}
+
+/// Format + colour one cell from its [`SideStats`] datum. `None`/absent → `—`.
+fn cell_text(kind: CellKind, s: &SideStats) -> (String, Color32) {
+    match kind {
+        // LAST: seconds since last trade, fixed 1-decimal seconds, single unit.
+        CellKind::Last => (fmt_secs(s.last_secs), theme::TEXT_DIM),
+        CellKind::Vol => (fmt_size(Some(s.vol)), theme::TEXT_DIM),
+        CellKind::Chg => fmt_chg(s.chg_cents),
+        CellKind::Spr => (fmt_cents(s.spr_cents), theme::TEXT_MUTED),
+        CellKind::BidSz => (fmt_size(s.bid_sz), theme::TEXT_DIM),
+        CellKind::Bid => (fmt_price(s.bid), theme::GREEN),
+        CellKind::Ask => (fmt_price(s.ask), theme::RED),
+        CellKind::AskSz => (fmt_size(s.ask_sz), theme::TEXT_DIM),
+    }
+}
+
+/// Seconds since last trade: fixed 1-decimal seconds, single unit, never minutes.
+fn fmt_secs(v: Option<f64>) -> String {
+    match v {
+        Some(s) if s.is_finite() => format!("{:.1}", s.max(0.0)),
+        _ => "—".to_string(),
+    }
+}
+
+/// Cents, 1 decimal (unsigned) — used for SPR¢.
+fn fmt_cents(v: Option<f64>) -> String {
+    match v {
+        Some(c) if c.is_finite() => format!("{c:.1}"),
+        _ => "—".to_string(),
+    }
+}
+
+/// Signed cents (explicit `+`/`−`) coloured by sign — used for CHG¢.
+fn fmt_chg(v: Option<f64>) -> (String, Color32) {
+    match v {
+        Some(c) if c.is_finite() => {
+            // ASCII +/- (JetBrains Mono lacks the U+2212 minus → tofu); colour by
+            // sign (flat = green).
+            let sign = if c < 0.0 { "-" } else { "+" };
+            let color = if c < 0.0 { theme::RED } else { theme::GREEN };
+            (format!("{sign}{:.1}", c.abs()), color)
+        }
+        _ => ("—".to_string(), theme::TEXT_DIMMER),
+    }
+}
+
+/// A probability price to 3 decimals.
+fn fmt_price(v: Option<f64>) -> String {
+    match v {
+        Some(p) if p.is_finite() => format!("{p:.3}"),
+        _ => "—".to_string(),
+    }
+}
+
+/// A size / volume as a whole number (0 volume still shows as `0`).
+fn fmt_size(v: Option<f64>) -> String {
+    match v {
+        Some(s) if s.is_finite() => format!("{s:.0}"),
+        _ => "—".to_string(),
+    }
+}
+
+/// The more-recent of the two sides' last trades, as `(t, up)`, or `None` if
+/// neither side has traded. Drives the row-flash trigger.
+fn latest_trade(yes: &SideStats, no: &SideStats) -> Option<(f64, bool)> {
+    let pick = |s: &SideStats| s.last_trade_t.map(|t| (t, s.last_trade_up.unwrap_or(true)));
+    match (pick(yes), pick(no)) {
+        (Some(a), Some(b)) => Some(if a.0 >= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Render-side row-flash state for one entity: when the animation started, its
+/// up/down colour, and the trade time that armed it (so a *later* trade re-arms).
+/// Wall-clock (`Instant`) here is purely visual — like the pill blink — and never
+/// feeds derived data.
+pub struct RowFlash {
+    /// When the current flash started (wall clock).
+    start: Instant,
+    /// Flash colour: `true` = up/green, `false` = down/red.
+    up: bool,
+    /// The trade time (view-model `t_secs`) that armed this flash.
+    armed_at_t: f64,
+}
+
+/// Update the per-entity flash state for the entity's latest trade and return the
+/// active flash `(up, factor)` if one is in progress, where `factor` eases from
+/// `1.0` at the trade down to `0.0` over [`FLASH_DECAY_SECS`]. A *later* trade
+/// time (vs the armed one) re-arms the animation.
+fn update_flash(
+    flash: &mut BTreeMap<AssetId, RowFlash>,
+    key: &AssetId,
+    trade: Option<(f64, bool)>,
+) -> Option<(bool, f32)> {
+    let (t, up) = trade?;
+    let now = Instant::now();
+    let entry = flash.entry(key.clone());
+    match entry {
+        std::collections::btree_map::Entry::Occupied(mut e) => {
+            if t != e.get().armed_at_t {
+                // The latest trade changed — a new trade printed, or the timeline
+                // was rewound/restarted (so `t` went backward). Either way re-arm
+                // (using `!=`, not `>`, keeps the flash working after a seek/restart
+                // rather than going stale against an old, larger armed time).
+                e.insert(RowFlash {
+                    start: now,
+                    up,
+                    armed_at_t: t,
+                });
+                Some((up, 1.0))
+            } else {
+                // Same trade as before → keep decaying from its start.
+                let f = flash_factor(e.get().start);
+                (f > 0.0).then_some((e.get().up, f))
+            }
+        }
+        std::collections::btree_map::Entry::Vacant(e) => {
+            e.insert(RowFlash {
+                start: now,
+                up,
+                armed_at_t: t,
+            });
+            Some((up, 1.0))
+        }
+    }
+}
+
+/// Ease-out flash factor (`1.0`→`0.0`) for an animation started at `start`.
+fn flash_factor(start: Instant) -> f32 {
+    let dt = start.elapsed().as_secs_f32();
+    if dt >= FLASH_DECAY_SECS {
+        0.0
+    } else {
+        let lin = 1.0 - dt / FLASH_DECAY_SECS;
+        // Ease-out (quadratic) for a calm decay.
+        lin * lin
+    }
+}
+
+/// Linear blend between two opaque colours by `f` in `0..=1` (`0` = `a`).
+fn lerp_color(a: Color32, b: Color32, f: f32) -> Color32 {
+    let f = f.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }

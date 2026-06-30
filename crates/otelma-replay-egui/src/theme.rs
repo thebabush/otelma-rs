@@ -32,7 +32,7 @@ pub enum Mode {
 pub enum ViewMode {
     /// The price/depth chart (default).
     Chart,
-    /// The dense option-chain grid (placeholder in this deliverable).
+    /// The dense option-chain grid.
     Chain,
 }
 
