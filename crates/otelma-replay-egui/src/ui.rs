@@ -810,21 +810,24 @@ pub fn scrubber(
     // Handle circle.
     painter.circle_filled(Pos2::new(handle_x, track_y), 5.5, dim(accent.base));
 
-    // Time bubble above the handle (playhead clock, in tz).
+    // Time bubble above the handle (playhead clock, in tz). It floats ~22px above
+    // the track — above the short scrubber panel — so draw it with an expanded
+    // clip rect; the panel's own clip would otherwise slice it in half.
     if let Some(now) = current_ts {
+        let bp = painter.with_clip_rect(full.expand(40.0));
         let bubble_center = Pos2::new(handle_x, track_y - 22.0);
         let text = theme::format_clock(now, tz);
-        let galley = painter.layout_no_wrap(text, mono(9.5), dim(accent.base));
+        let galley = bp.layout_no_wrap(text, mono(9.5), dim(accent.base));
         let pad = Vec2::new(5.0, 2.0);
         let bubble = Rect::from_center_size(bubble_center, galley.size() + pad * 2.0);
-        painter.rect_filled(bubble, 3.0, theme::BG_INPUT);
-        painter.rect_stroke(
+        bp.rect_filled(bubble, 3.0, theme::BG_INPUT);
+        bp.rect_stroke(
             bubble,
             3.0,
             Stroke::new(1.0, dim(accent.base)),
             egui::StrokeKind::Inside,
         );
-        painter.galley(bubble.min + pad, galley, dim(accent.base));
+        bp.galley(bubble.min + pad, galley, dim(accent.base));
     }
 
     // Start label (left) and end / LIVE label (right).
