@@ -16,18 +16,32 @@ use otelma_polymarket::PolyEvent;
 
 use crate::state::{GuiSink, ReplayState};
 
+/// Where a pre-roll stops: at a recorded timestamp (scrubber seek) or a sequence
+/// number (single-step ←/→).
+#[derive(Clone, Copy)]
+enum StopAt {
+    Ts(DateTime<Utc>),
+    Seq(u64),
+}
+
+impl StopAt {
+    /// Whether the just-applied message reaches the stop point.
+    fn reached(self, seq: u64, ts: DateTime<Utc>) -> bool {
+        match self {
+            StopAt::Ts(t) => ts >= t,
+            StopAt::Seq(s) => seq >= s,
+        }
+    }
+}
+
 /// A pre-roll request handed to the feeder thread before paced playback resumes.
 enum Seek {
-    /// State was cleared by the caller; apply `[0, target]` so the chart rebuilds
-    /// from the start (a backward seek, the only way to rewind).
-    Rebuild { target: DateTime<Utc> },
+    /// State was cleared by the caller; apply from the start up to `stop` (a
+    /// backward seek/step — the only way to rewind).
+    Rebuild { stop: StopAt },
     /// State is kept; skip messages already applied (`seq <= from_seq`) and apply
-    /// only `(from_seq, target]` — a forward seek fast-forwards in place, never
-    /// restarting from the start.
-    Forward {
-        from_seq: u64,
-        target: DateTime<Utc>,
-    },
+    /// only `(from_seq, stop]` — a forward seek/step in place, never restarting.
+    Forward { from_seq: u64, stop: StopAt },
 }
 
 /// Owns the feeder thread and the state it writes into.
@@ -86,12 +100,12 @@ impl Feeder {
             // applies everything (rebuild). We consume the reader by reference,
             // then pass it on so paced playback continues from where it left off.
             if let Some(seek) = seek {
-                let (skip_after, target) = match seek {
-                    Seek::Rebuild { target } => (None, target),
-                    Seek::Forward { from_seq, target } => (Some(from_seq), target),
+                let (skip_after, stop) = match seek {
+                    Seek::Rebuild { stop } => (None, stop),
+                    Seek::Forward { from_seq, stop } => (Some(from_seq), stop),
                 };
                 // Un-paced: pull straight from the reader (true max speed) and stop
-                // on the first message at/after the target (exact). `skip_after`
+                // on the first message that reaches `stop` (exact). `skip_after`
                 // skips messages already in the kept state (forward seek).
                 for item in reader.by_ref() {
                     let msg = match item {
@@ -104,7 +118,7 @@ impl Feeder {
                     if skip_after.is_none_or(|s| msg.seq > s) {
                         locking.apply(&msg);
                     }
-                    if msg.timestamp >= target {
+                    if stop.reached(msg.seq, msg.timestamp) {
                         break;
                     }
                     if control.should_stop() {
@@ -152,13 +166,42 @@ impl Feeder {
             // playhead to the target — instant and exact.
             self.spawn(Some(Seek::Forward {
                 from_seq: from_seq.unwrap_or(0),
-                target,
+                stop: StopAt::Ts(target),
             }));
         } else {
             if let Ok(mut s) = self.state.lock() {
                 s.clear();
             }
-            self.spawn(Some(Seek::Rebuild { target }));
+            self.spawn(Some(Seek::Rebuild {
+                stop: StopAt::Ts(target),
+            }));
+        }
+    }
+
+    /// Step the playhead by `delta` messages (e.g. +1 / −1 for →/←) and pause.
+    /// Forward keeps the chart and applies the next message(s) in place; backward
+    /// rebuilds to the target seq. No-op until at least one message is applied.
+    pub fn step(&mut self, delta: i64) {
+        let cur = self.state.lock().ok().and_then(|s| s.current_seq);
+        let Some(cur) = cur else {
+            return;
+        };
+        let target = cur.saturating_add_signed(delta);
+        self.stop_and_join();
+        self.refresh_control();
+        self.control.pause(); // stepping always lands paused
+        if target > cur {
+            self.spawn(Some(Seek::Forward {
+                from_seq: cur,
+                stop: StopAt::Seq(target),
+            }));
+        } else {
+            if let Ok(mut s) = self.state.lock() {
+                s.clear();
+            }
+            self.spawn(Some(Seek::Rebuild {
+                stop: StopAt::Seq(target),
+            }));
         }
     }
 
@@ -349,6 +392,42 @@ mod tests {
         );
         assert_eq!(snap.current_ts, Some(base + chrono::Duration::seconds(70)));
         assert_eq!(snap.start_ts, Some(base), "chart still spans from t=0");
+
+        feeder.stop_and_join();
+    }
+
+    /// `step(+1)`/`step(-1)` move the playhead exactly one message and land paused.
+    #[test]
+    fn step_moves_one_message_and_pauses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let msgs = record_session(dir.path());
+        let base = msgs[0].timestamp;
+
+        let mut feeder = Feeder::start(dir.path().to_path_buf(), 1.0);
+        feeder.control.pause();
+        // Land on msg 5 (50s).
+        feeder.seek_to(base + chrono::Duration::seconds(50));
+        wait_until(&feeder, Duration::from_secs(5), |s| {
+            s.current_seq == Some(5)
+        });
+
+        // Forward one → msg 6, paused.
+        feeder.step(1);
+        let snap = wait_until(&feeder, Duration::from_secs(5), |s| {
+            s.current_seq == Some(6)
+        });
+        assert_eq!(
+            snap.message_count, 7,
+            "extended by exactly one (msgs 0..=6)"
+        );
+        assert!(feeder.control.is_paused(), "stepping lands paused");
+
+        // Back one → msg 5 again.
+        feeder.step(-1);
+        let snap = wait_until(&feeder, Duration::from_secs(5), |s| {
+            s.current_seq == Some(5)
+        });
+        assert_eq!(snap.current_ts, Some(base + chrono::Duration::seconds(50)));
 
         feeder.stop_and_join();
     }

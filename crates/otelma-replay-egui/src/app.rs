@@ -649,6 +649,40 @@ impl eframe::App for ReplayApp {
             }
         }
 
+        // Keyboard shortcuts (the footer's hints). Skipped while a widget (the
+        // search box) has focus, and no-ops in LIVE (no Replay source).
+        if ctx.memory(|m| m.focused().is_none()) {
+            let (mut toggle, mut restart, mut step) = (false, false, 0i64);
+            ctx.input(|i| {
+                toggle = i.key_pressed(egui::Key::Space);
+                restart = i.key_pressed(egui::Key::R);
+                if i.key_pressed(egui::Key::ArrowRight) {
+                    step += 1;
+                }
+                if i.key_pressed(egui::Key::ArrowLeft) {
+                    step -= 1;
+                }
+            });
+            if let Source::Replay { feeder, .. } = &mut self.source {
+                if toggle {
+                    if feeder.control.is_paused() {
+                        feeder.control.resume();
+                    } else {
+                        feeder.control.pause();
+                    }
+                }
+                if restart {
+                    feeder.restart();
+                    self.scrub_preview = None;
+                    self.ff_target = None;
+                }
+                if step != 0 {
+                    feeder.step(step);
+                    self.ff_target = None;
+                }
+            }
+        }
+
         egui::Panel::top("title_bar")
             .exact_size(TITLE_BAR_H)
             .frame(
