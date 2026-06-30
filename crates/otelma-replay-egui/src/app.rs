@@ -159,6 +159,18 @@ impl ReplayApp {
         self.source.snapshot()
     }
 
+    /// Seek the replay to `target`. Shared by a scrubber drag-release and a click.
+    /// A forward seek (past `current_ts`) sweeps at max — recorded in `ff_target`
+    /// so the `max` checkbox shows active until the playhead reaches it; the feeder
+    /// rebuilds for a backward seek. No-op in LIVE.
+    fn commit_seek(&mut self, target: DateTime<Utc>, current_ts: Option<DateTime<Utc>>) {
+        let forward = current_ts.is_some_and(|c| target > c);
+        if let Source::Replay { feeder, .. } = &mut self.source {
+            feeder.seek_to(target);
+        }
+        self.ff_target = forward.then_some(target);
+    }
+
     // ── Title bar ────────────────────────────────────────────────────────────
 
     fn title_bar_ui(&mut self, ui: &mut egui::Ui, mode: Mode, accent: Accent) {
@@ -523,26 +535,16 @@ impl ReplayApp {
             });
         match action {
             Some(ui::ScrubAction::Preview(t)) => self.scrub_preview = Some(t),
+            // Drag-release commits the previewed time; a click commits directly.
+            // Both go through the same seek logic.
             Some(ui::ScrubAction::Release) => {
                 if let Some(t) = self.scrub_preview.take() {
-                    let forward = state.current_ts.is_some_and(|c| t > c);
-                    if let Source::Replay { feeder, .. } = &mut self.source {
-                        feeder.seek_to(t);
-                    }
-                    // A forward seek sweeps at max — show that on the checkbox
-                    // until the playhead reaches the target.
-                    self.ff_target = forward.then_some(t);
+                    self.commit_seek(t, state.current_ts);
                 }
             }
             Some(ui::ScrubAction::Click(t)) => {
                 self.scrub_preview = None;
-                let forward = state.current_ts.is_some_and(|c| t > c);
-                if let Source::Replay { feeder, .. } = &mut self.source {
-                    feeder.seek_to(t);
-                }
-                // Same as a drag-release: a forward click sweeps at max, shown on
-                // the checkbox until the playhead reaches the target.
-                self.ff_target = forward.then_some(t);
+                self.commit_seek(t, state.current_ts);
             }
             None => {}
         }
