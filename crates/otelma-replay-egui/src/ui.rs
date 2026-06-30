@@ -811,10 +811,13 @@ pub fn scrubber(
     painter.circle_filled(Pos2::new(handle_x, track_y), 5.5, dim(accent.base));
 
     // Time bubble above the handle (playhead clock, in tz). It floats ~22px above
-    // the track — above the short scrubber panel — so draw it with an expanded
-    // clip rect; the panel's own clip would otherwise slice it in half.
+    // the track — above the short scrubber panel — so paint it on a foreground
+    // layer (full-screen clip), else the panel slices it in half.
     if let Some(now) = current_ts {
-        let bp = painter.with_clip_rect(full.expand(40.0));
+        let bp = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            ui.id().with("scrubber_bubble"),
+        ));
         let bubble_center = Pos2::new(handle_x, track_y - 22.0);
         let text = theme::format_clock(now, tz);
         let galley = bp.layout_no_wrap(text, mono(9.5), dim(accent.base));

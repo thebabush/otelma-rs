@@ -16,6 +16,20 @@ use otelma_polymarket::PolyEvent;
 
 use crate::state::{GuiSink, ReplayState};
 
+/// A pre-roll request handed to the feeder thread before paced playback resumes.
+enum Seek {
+    /// State was cleared by the caller; apply `[0, target]` so the chart rebuilds
+    /// from the start (a backward seek, the only way to rewind).
+    Rebuild { target: DateTime<Utc> },
+    /// State is kept; skip messages already applied (`seq <= from_seq`) and apply
+    /// only `(from_seq, target]` — a forward seek fast-forwards in place, never
+    /// restarting from the start.
+    Forward {
+        from_seq: u64,
+        target: DateTime<Utc>,
+    },
+}
+
 /// Owns the feeder thread and the state it writes into.
 pub struct Feeder {
     pub session_dir: PathBuf,
@@ -41,14 +55,14 @@ impl Feeder {
 
     /// Spawn a feeder thread for the current session into the current state.
     ///
-    /// When `seek_to` is `Some(target)`, the thread first **fast-forwards**: it
-    /// pulls messages from the reader and applies them to the sink with NO
-    /// pacing until a message's timestamp `>= target`, then hands the *same*
-    /// partially-consumed reader to [`drive_realtime`] for paced playback of the
-    /// remainder. This keeps the seek out of core's `drive_realtime` (no engine
-    /// change): the pre-roll uses the reader's `Iterator` directly. State is
-    /// expected to be cleared by the caller, so the chart rebuilds `[0, target]`.
-    fn spawn(&mut self, seek_to: Option<DateTime<Utc>>) {
+    /// A `Seek` runs an **un-paced pre-roll** before paced playback: it pulls
+    /// messages straight from the reader's `Iterator` (no sleeping), then hands
+    /// the *same* partially-consumed reader to [`drive_realtime`] for the
+    /// remainder — keeping seek out of core's drive (no engine change). The
+    /// pre-roll being un-paced is what makes a seek effectively instant ("max
+    /// speed"). [`Seek::Rebuild`] applies `[0, target]` (state was cleared);
+    /// [`Seek::Forward`] keeps the chart and applies only `(from_seq, target]`.
+    fn spawn(&mut self, seek: Option<Seek>) {
         let session_dir = self.session_dir.clone();
         let state = Arc::clone(&self.state);
         let control = Arc::clone(&self.control);
@@ -67,22 +81,27 @@ impl Feeder {
             // `drive_realtime`, never while holding the lock.
             let mut locking = LockingSink { state: &state };
 
-            // Pre-roll: fast-forward (no pacing) up to the seek target, applying
-            // each message so the chart rebuilds `[0, target]`. We consume the
-            // reader by reference, then pass it on so paced playback continues
-            // from exactly where the pre-roll left off — no core change needed.
-            if let Some(target) = seek_to {
-                for msg in reader.by_ref() {
-                    let msg = match msg {
+            // Pre-roll (un-paced) up to the seek target. `skip_after = Some(seq)`
+            // skips messages already in the kept state (forward seek); `None`
+            // applies everything (rebuild). We consume the reader by reference,
+            // then pass it on so paced playback continues from where it left off.
+            if let Some(seek) = seek {
+                let (skip_after, target) = match seek {
+                    Seek::Rebuild { target } => (None, target),
+                    Seek::Forward { from_seq, target } => (Some(from_seq), target),
+                };
+                for item in reader.by_ref() {
+                    let msg = match item {
                         Ok(msg) => msg,
                         Err(e) => {
                             eprintln!("feeder: seek pre-roll error: {e}");
                             return;
                         }
                     };
-                    let reached = msg.timestamp >= target;
-                    locking.apply(&msg);
-                    if reached {
+                    if skip_after.is_none_or(|s| msg.seq > s) {
+                        locking.apply(&msg);
+                    }
+                    if msg.timestamp >= target {
                         break;
                     }
                     if control.should_stop() {
@@ -98,28 +117,51 @@ impl Feeder {
         self.handle = Some(handle);
     }
 
-    /// Restart from the beginning: stop the current thread, reset state and the
-    /// control's stop flag, and spawn afresh. Preserves the current speed and
-    /// pause state.
+    /// Restart from the beginning: stop the current thread, clear state, and
+    /// spawn afresh. Preserves the current speed and pause state. (The selected
+    /// asset is owned by the app and is intentionally *not* reset here.)
     pub fn restart(&mut self) {
-        self.respawn(None);
-    }
-
-    /// Seek to `target` (recorded message time): like [`restart`](Self::restart),
-    /// but the fresh feeder thread fast-forwards (un-paced) until a message's
-    /// timestamp reaches `target` before resuming paced playback. Preserves the
-    /// current speed and pause state, and rebuilds the chart over `[0, target]`.
-    /// Deterministic: `target` is a recorded timestamp, never a wall-clock read.
-    pub fn seek_to(&mut self, target: DateTime<Utc>) {
-        self.respawn(Some(target));
-    }
-
-    /// Stop the current thread, build a fresh control carrying over speed/pause,
-    /// clear the state, and spawn a new thread (optionally seeking).
-    fn respawn(&mut self, seek_to: Option<DateTime<Utc>>) {
         self.stop_and_join();
-        // The control's `stop` is irreversible by design, so build a fresh one
-        // carrying over speed and pause.
+        self.refresh_control();
+        if let Ok(mut s) = self.state.lock() {
+            s.clear();
+        }
+        self.spawn(None);
+    }
+
+    /// Seek to `target` (recorded message time). A **forward** seek (past the
+    /// current playhead) fast-forwards *in place*: the chart is kept and only
+    /// `(playhead, target]` is applied, so it never restarts from the start. A
+    /// **backward** seek clears and rebuilds `[0, target]` (the only way to
+    /// rewind). Either way the un-paced pre-roll makes the jump effectively
+    /// instant, then paced playback resumes at the current speed. Deterministic:
+    /// `target` is a recorded timestamp, never a wall-clock read.
+    pub fn seek_to(&mut self, target: DateTime<Utc>) {
+        let (from_seq, from_ts) = self
+            .state
+            .lock()
+            .map(|s| (s.current_seq, s.current_ts))
+            .unwrap_or((None, None));
+        self.stop_and_join();
+        self.refresh_control();
+        if from_ts.is_some_and(|t| target > t) {
+            // Forward: keep the chart, fast-forward from the current playhead.
+            self.spawn(Some(Seek::Forward {
+                from_seq: from_seq.unwrap_or(0),
+                target,
+            }));
+        } else {
+            if let Ok(mut s) = self.state.lock() {
+                s.clear();
+            }
+            self.spawn(Some(Seek::Rebuild { target }));
+        }
+    }
+
+    /// Build a fresh [`PlaybackControl`] carrying over speed and pause (the old
+    /// control's `stop` is irreversible by design, so a restart/seek needs a new
+    /// one).
+    fn refresh_control(&mut self) {
         let speed = self.control.speed();
         let paused = self.control.is_paused();
         let fresh = PlaybackControl::new(speed);
@@ -127,10 +169,6 @@ impl Feeder {
             fresh.pause();
         }
         self.control = Arc::new(fresh);
-        if let Ok(mut s) = self.state.lock() {
-            s.clear();
-        }
-        self.spawn(seek_to);
     }
 
     /// Signal stop and join the feeder thread.
@@ -271,6 +309,43 @@ mod tests {
         // All 10 messages eventually applied (pre-roll 6 + paced remainder 4).
         let snap = wait_until(&feeder, Duration::from_secs(5), |s| s.message_count == 10);
         assert_eq!(snap.current_seq, Some(9));
+        feeder.stop_and_join();
+    }
+
+    /// A forward seek (target past the current playhead) fast-forwards *in place*:
+    /// it keeps the existing chart and applies only the new messages, rather than
+    /// clearing and rebuilding from t=0. Result: the chart still spans from the
+    /// start, the playhead reaches the target, and no message is double-applied.
+    #[test]
+    fn forward_seek_keeps_chart_and_extends_to_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let msgs = record_session(dir.path());
+        let base = msgs[0].timestamp;
+
+        // Paused so paced playback can't advance on its own between the seeks.
+        let mut feeder = Feeder::start(dir.path().to_path_buf(), 1.0);
+        feeder.control.pause();
+
+        // Establish a playhead at 20s (msg 2): three messages applied.
+        feeder.seek_to(base + chrono::Duration::seconds(20));
+        let snap = wait_until(&feeder, Duration::from_secs(5), |s| {
+            s.current_seq == Some(2)
+        });
+        assert_eq!(snap.message_count, 3);
+
+        // Forward-seek to 70s (msg 7). This must extend the kept chart to msg 7,
+        // not rebuild: total applied = 8 (msgs 0..=7), never more (no re-apply).
+        feeder.seek_to(base + chrono::Duration::seconds(70));
+        let snap = wait_until(&feeder, Duration::from_secs(5), |s| {
+            s.current_seq == Some(7)
+        });
+        assert_eq!(
+            snap.message_count, 8,
+            "extended to msg 7, nothing re-applied"
+        );
+        assert_eq!(snap.current_ts, Some(base + chrono::Duration::seconds(70)));
+        assert_eq!(snap.start_ts, Some(base), "chart still spans from t=0");
+
         feeder.stop_and_join();
     }
 }

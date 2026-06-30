@@ -305,7 +305,6 @@ impl ReplayApp {
             .clicked()
         {
             feeder.restart();
-            self.selected_asset = None;
         }
 
         ui.separator();
