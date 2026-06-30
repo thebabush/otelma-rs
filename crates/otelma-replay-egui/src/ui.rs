@@ -204,18 +204,30 @@ pub fn price_chart(
     }
 
     if !visible.is_empty() {
-        // Bid/ask band: bid-line (L→R) then ask-line (R→L), filled.
-        let mut band: Vec<Pos2> = visible
-            .iter()
-            .map(|p| Pos2::new(map.px(p.t_secs), map.py(p.best_bid)))
-            .collect();
-        band.extend(
-            visible
-                .iter()
-                .rev()
-                .map(|p| Pos2::new(map.px(p.t_secs), map.py(p.best_ask))),
-        );
-        painter.add(egui::Shape::convex_polygon(band, accent.band, Stroke::NONE));
+        // Bid/ask band: one triangle mesh forming a strip between the bid and ask
+        // lines. A single polygon over the whole bid→reversed-ask ribbon is
+        // *concave* (it wiggles with the price), so `convex_polygon` would fill
+        // its convex hull — a giant wedge fanning from the extremes. Instead each
+        // adjacent segment contributes a quad (bid_a, bid_b, ask_b, ask_a → two
+        // triangles), so the strip is a thin ribbon hugging the mid line. A single
+        // mesh keeps a long-session replay (tens of thousands of points) to one
+        // draw, not one shape per segment.
+        let mut band = egui::Mesh::default();
+        for w in visible.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            let base = band.vertices.len() as u32;
+            for pos in [
+                Pos2::new(map.px(a.t_secs), map.py(a.best_bid)),
+                Pos2::new(map.px(b.t_secs), map.py(b.best_bid)),
+                Pos2::new(map.px(b.t_secs), map.py(b.best_ask)),
+                Pos2::new(map.px(a.t_secs), map.py(a.best_ask)),
+            ] {
+                band.colored_vertex(pos, accent.band);
+            }
+            band.add_triangle(base, base + 1, base + 2);
+            band.add_triangle(base, base + 2, base + 3);
+        }
+        painter.add(egui::Shape::mesh(band));
 
         // Mid line (accent, 1.8px, rounded joins via Shape::line).
         let mid: Vec<Pos2> = visible
