@@ -556,17 +556,23 @@ fn sidebar_row(
         .inner_margin(egui::Margin::symmetric(13, 6))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::Label::new(RichText::new(&row.row_label).size(11.0).color(label_color))
+            // Price first (right-aligned, fixed width); the name then fills the
+            // remaining width to its left and truncates — otherwise a long name
+            // runs under the price.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let price = match row.price {
+                    Some(p) => format!("{p:.3}"),
+                    None => "—".to_string(),
+                };
+                ui.label(RichText::new(price).size(11.0).color(price_color));
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&row.row_label).size(11.0).color(label_color),
+                        )
                         .truncate(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let price = match row.price {
-                        Some(p) => format!("{p:.3}"),
-                        None => "—".to_string(),
-                    };
-                    ui.label(RichText::new(price).size(11.0).color(price_color));
+                    );
                 });
             });
         })
