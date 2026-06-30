@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use otelma::{drive_realtime, PlaybackControl, SessionReader, Sink};
@@ -27,8 +28,15 @@ enum Seek {
     Forward {
         from_seq: u64,
         target: DateTime<Utc>,
+        /// Pacing multiplier for the visible fast-forward sweep (so the chart
+        /// animates to the target at "max" rather than jumping instantly).
+        speed: f64,
     },
 }
+
+/// Wall-clock budget for a forward-seek sweep: the pacing speed is chosen so the
+/// gap to the target plays out over roughly this long, whatever the distance.
+const FF_DURATION_SECS: f64 = 0.6;
 
 /// Owns the feeder thread and the state it writes into.
 pub struct Feeder {
@@ -86,10 +94,15 @@ impl Feeder {
             // applies everything (rebuild). We consume the reader by reference,
             // then pass it on so paced playback continues from where it left off.
             if let Some(seek) = seek {
-                let (skip_after, target) = match seek {
-                    Seek::Rebuild { target } => (None, target),
-                    Seek::Forward { from_seq, target } => (Some(from_seq), target),
+                let (skip_after, target, pace) = match seek {
+                    Seek::Rebuild { target } => (None, target, None),
+                    Seek::Forward {
+                        from_seq,
+                        target,
+                        speed,
+                    } => (Some(from_seq), target, Some(speed)),
                 };
+                let mut prev: Option<DateTime<Utc>> = None;
                 for item in reader.by_ref() {
                     let msg = match item {
                         Ok(msg) => msg,
@@ -99,6 +112,13 @@ impl Feeder {
                         }
                     };
                     if skip_after.is_none_or(|s| msg.seq > s) {
+                        // Forward sweep is paced (animated "max"); a rebuild (and
+                        // the skipped lead-in) is instant.
+                        if let (Some(speed), Some(p)) = (pace, prev) {
+                            let gap = (msg.timestamp - p).num_milliseconds() as f64 / 1000.0;
+                            ff_sleep(gap, speed, &control);
+                        }
+                        prev = Some(msg.timestamp);
                         locking.apply(&msg);
                     }
                     if msg.timestamp >= target {
@@ -144,11 +164,15 @@ impl Feeder {
             .unwrap_or((None, None));
         self.stop_and_join();
         self.refresh_control();
-        if from_ts.is_some_and(|t| target > t) {
-            // Forward: keep the chart, fast-forward from the current playhead.
+        if let Some(from) = from_ts.filter(|t| target > *t) {
+            // Forward: keep the chart and sweep from the playhead at a speed that
+            // covers the gap in ~FF_DURATION_SECS — a visible "max" fast-forward.
+            let span = (target - from).num_milliseconds() as f64 / 1000.0;
+            let speed = (span / FF_DURATION_SECS).max(1.0);
             self.spawn(Some(Seek::Forward {
                 from_seq: from_seq.unwrap_or(0),
                 target,
+                speed,
             }));
         } else {
             if let Ok(mut s) = self.state.lock() {
@@ -183,6 +207,23 @@ impl Feeder {
 impl Drop for Feeder {
     fn drop(&mut self) {
         self.stop_and_join();
+    }
+}
+
+/// Sleep `gap_secs / speed` in short slices, aborting promptly on stop — paces
+/// the forward-seek sweep so it animates instead of jumping instantly.
+fn ff_sleep(gap_secs: f64, speed: f64, control: &PlaybackControl) {
+    if speed <= 0.0 || gap_secs <= 0.0 {
+        return;
+    }
+    let mut remaining = Duration::from_secs_f64(gap_secs / speed);
+    while remaining > Duration::ZERO {
+        if control.should_stop() {
+            return;
+        }
+        let slice = remaining.min(Duration::from_millis(16));
+        std::thread::sleep(slice);
+        remaining -= slice;
     }
 }
 

@@ -105,6 +105,9 @@ pub struct ReplayApp {
     /// line on the plots). `None` when not dragging; the actual seek happens on
     /// release. Render-only state.
     scrub_preview: Option<DateTime<Utc>>,
+    /// While a forward seek is sweeping at max speed: its target time. The `max`
+    /// checkbox shows active until the playhead reaches it, then this clears.
+    ff_target: Option<DateTime<Utc>>,
     /// Whether fonts/visuals have been installed (done on first frame, where we
     /// have a `Context`).
     styled: bool,
@@ -145,6 +148,7 @@ impl ReplayApp {
             tz: Timezone::Local,
             y_scale: YScale::Auto,
             scrub_preview: None,
+            ff_target: None,
             styled: false,
             started: Instant::now(),
         }
@@ -159,14 +163,7 @@ impl ReplayApp {
 
     fn title_bar_ui(&mut self, ui: &mut egui::Ui, mode: Mode, accent: Accent) {
         ui.horizontal_centered(|ui| {
-            ui.add_space(6.0);
-            // Decorative macOS-style dots.
-            for _ in 0..3 {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
-                ui.painter().circle_filled(rect.center(), 4.5, theme::DOT);
-                ui.add_space(3.0);
-            }
-            ui.add_space(6.0);
+            ui.add_space(12.0);
             ui.label(
                 RichText::new("otelma · replayer")
                     .size(11.0)
@@ -282,21 +279,26 @@ impl ReplayApp {
         } = &mut self.source
         else {
             // LIVE: draw inert spec'd controls so the disabled state is visible.
-            ui.label(RichText::new("▶ Play").size(11.0).color(theme::TEXT_BRIGHT));
-            ui.label(RichText::new("↺ Restart").size(11.0).color(theme::TEXT_DIM));
+            ui.label(RichText::new("Play").size(11.0).color(theme::TEXT_BRIGHT));
+            ui.label(RichText::new("Restart").size(11.0).color(theme::TEXT_DIM));
             ui.label(RichText::new("SPEED").size(9.5).color(theme::TEXT_LABEL));
             return;
         };
 
         let paused = feeder.control.is_paused();
-        let glyph = if paused { "▶" } else { "❚❚" };
         let label = if paused { "Play" } else { "Pause" };
         let play = ui.button(
-            RichText::new(format!("{glyph} {label}"))
+            RichText::new(format!("   {label}"))
                 .size(11.0)
                 .color(theme::TEXT_BRIGHT),
         );
-        let _ = accent; // accent glyph tint is a later visual refinement.
+        // Painted glyph (accent-tinted) — renders regardless of font coverage.
+        let icon_c = egui::pos2(play.rect.left() + 12.0, play.rect.center().y);
+        if paused {
+            crate::ui::paint_play(ui.painter(), icon_c, accent.base);
+        } else {
+            crate::ui::paint_pause(ui.painter(), icon_c, accent.base);
+        }
         if play.clicked() {
             if paused {
                 feeder.control.resume();
@@ -326,7 +328,8 @@ impl ReplayApp {
             }
         });
 
-        let mut want_fast = *fast;
+        // Show `max` active during a forward-seek sweep too (not just steady max).
+        let mut want_fast = *fast || self.ff_target.is_some();
         if ui.checkbox(&mut want_fast, "max").changed() {
             *fast = want_fast;
             if want_fast {
@@ -359,7 +362,6 @@ impl ReplayApp {
             None => "—".to_string(),
         };
         ui.label(RichText::new(ts).size(11.0).color(theme::TEXT_PRIMARY));
-        ui.label(RichText::new("⧗").size(10.0).color(theme::TEXT_DIMMER));
     }
 
     fn stats_ui(&self, ui: &mut egui::Ui, state: &ReplayState, mode: Mode) {
@@ -523,13 +525,18 @@ impl ReplayApp {
             Some(ui::ScrubAction::Preview(t)) => self.scrub_preview = Some(t),
             Some(ui::ScrubAction::Release) => {
                 if let Some(t) = self.scrub_preview.take() {
+                    let forward = state.current_ts.is_some_and(|c| t > c);
                     if let Source::Replay { feeder, .. } = &mut self.source {
                         feeder.seek_to(t);
                     }
+                    // A forward seek sweeps at max — show that on the checkbox
+                    // until the playhead reaches the target.
+                    self.ff_target = forward.then_some(t);
                 }
             }
             Some(ui::ScrubAction::Click(t)) => {
                 self.scrub_preview = None;
+                self.ff_target = None;
                 if let Source::Replay { feeder, .. } = &mut self.source {
                     feeder.seek_to(t);
                 }
@@ -628,6 +635,14 @@ impl eframe::App for ReplayApp {
         let mode = self.source.mode();
         let accent = theme::accent_for(mode);
         let state = self.snapshot();
+
+        // A forward-seek sweep is done once the playhead reaches its target; clear
+        // the "max" indicator then.
+        if let Some(t) = self.ff_target {
+            if state.current_ts.is_some_and(|c| c >= t) {
+                self.ff_target = None;
+            }
+        }
 
         egui::Panel::top("title_bar")
             .exact_size(TITLE_BAR_H)

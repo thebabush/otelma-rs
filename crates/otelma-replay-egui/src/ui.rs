@@ -36,6 +36,42 @@ fn mono(size: f32) -> FontId {
     FontId::monospace(size)
 }
 
+/// Paint a small play triangle centred at `c`. Painted (not a glyph) so it
+/// renders regardless of the font's symbol coverage.
+pub fn paint_play(painter: &egui::Painter, c: Pos2, color: Color32) {
+    let s = 4.5;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(c.x - s * 0.6, c.y - s),
+            Pos2::new(c.x - s * 0.6, c.y + s),
+            Pos2::new(c.x + s, c.y),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+/// Paint a small pause icon (two bars) centred at `c`.
+pub fn paint_pause(painter: &egui::Painter, c: Pos2, color: Color32) {
+    let (h, w, gap) = (5.0, 1.7, 1.8);
+    painter.rect_filled(
+        Rect::from_min_max(
+            Pos2::new(c.x - gap - w, c.y - h),
+            Pos2::new(c.x - gap, c.y + h),
+        ),
+        0.0,
+        color,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(
+            Pos2::new(c.x + gap, c.y - h),
+            Pos2::new(c.x + gap + w, c.y + h),
+        ),
+        0.0,
+        color,
+    );
+}
+
 /// The chart header: market title (left, ellipsis), then the `AUTO | 0–1`
 /// toggle, `mid <v>`, and `spread <v>` (right). Returns the (possibly toggled)
 /// scale so the caller can store it.
@@ -448,7 +484,6 @@ pub fn market_sidebar(
         .inner_margin(egui::Margin::symmetric(11, 10))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("⌕").size(11.0).color(theme::TEXT_FAINT));
                 let edit = egui::TextEdit::singleline(query)
                     .hint_text(RichText::new("search markets…").color(theme::TEXT_DIMMER))
                     .desired_width(f32::INFINITY);
